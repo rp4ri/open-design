@@ -1,0 +1,9 @@
+# Personal customizations — never overwrite from upstream
+tools/pack/resources/mac/icon.icns merge=ours
+tools/pack/resources/mac/icon.png merge=ours
+tools/pack/resources/linux/icon.png merge=ours
+apps/web/public/app-icon.svg merge=ours
+apps/web/public/logo.svg merge=ours
+mobile/** merge=ours
+.gitattributes merge=ours
+.github/workflows/sync-upstream.yml merge=ours

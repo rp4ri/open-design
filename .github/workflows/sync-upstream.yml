@@ -1,0 +1,58 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # daily at 8am UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config merge.ours.driver true
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/nexu-io/open-design.git
+
+      - name: Fetch upstream
+        run: git fetch upstream main
+
+      - name: Attempt merge
+        id: merge
+        run: |
+          if git merge upstream/main --no-edit; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push if clean
+        if: steps.merge.outputs.status == 'clean'
+        run: git push origin main
+
+      - name: Create PR if conflict
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          branch="sync/upstream-$(date +%Y%m%d)"
+          git checkout -b "$branch"
+          git merge upstream/main --no-edit || true
+          git add -A
+          git commit -m "chore: sync upstream (conflicts need manual resolution)" || true
+          git push origin "$branch"
+          gh pr create \
+            --title "chore: sync upstream (manual resolution needed)" \
+            --body "Automated upstream sync found conflicts. Please resolve manually." \
+            --head "$branch" \
+            --base main
