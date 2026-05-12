@@ -1,0 +1,55 @@
+name: Build macOS .dmg
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'tools/pack/**'
+      - 'pnpm-lock.yaml'
+
+concurrency:
+  group: build-mac
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build tools-pack
+        run: pnpm --filter @open-design/tools-pack build
+
+      - name: Build .dmg (unsigned)
+        run: pnpm tools-pack mac build --to dmg
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Find .dmg artifact
+        id: dmg
+        run: |
+          dmg_path=$(find . -name "*.dmg" -path "*/output/*" | head -1)
+          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-design-mac-unsigned
+          path: ${{ steps.dmg.outputs.path }}
+          retention-days: 30
