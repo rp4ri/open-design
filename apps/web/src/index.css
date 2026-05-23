@@ -10057,6 +10057,120 @@ button.connector-action.is-loading {
   background: var(--bg-subtle);
 }
 
+.ws-tab.grid-overview-tab {
+  font-weight: 500;
+  color: var(--text);
+  position: sticky;
+  left: 110px;
+  z-index: 1;
+  background: var(--bg-panel);
+  box-shadow: 4px 0 6px -4px rgba(0, 0, 0, 0.12);
+}
+.ws-tab.grid-overview-tab.active {
+  background: var(--bg-subtle);
+}
+
+/* ---- Infinite Canvas (Grid Overview) ---- */
+.go-canvas {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background-color: var(--bg, #0a0a0a);
+  background-image: radial-gradient(circle, var(--border, #2a2a2a) 1px, transparent 1px);
+  background-size: 24px 24px;
+  touch-action: none;
+  user-select: none;
+}
+.go-world {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
+}
+.go-frame {
+  position: absolute;
+}
+.go-selected > .go-frame-viewport {
+  box-shadow: 0 0 0 2px var(--accent, #3b82f6);
+}
+.go-frame:active {
+  cursor: grabbing;
+}
+.go-frame-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted, #999);
+  white-space: nowrap;
+  padding: 0 2px 4px;
+  pointer-events: none;
+}
+.go-selected > .go-frame-label {
+  color: var(--accent, #3b82f6);
+}
+.go-frame:hover .go-frame-label {
+  color: var(--accent, #3b82f6);
+}
+.go-frame-viewport {
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px var(--border, #2a2a2a);
+  background: #fff;
+}
+.go-frame:hover .go-frame-viewport {
+  box-shadow: 0 0 0 2px var(--accent, #3b82f6);
+}
+.go-toolbar {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--bg-panel, #141414);
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+  color: var(--text-muted, #999);
+}
+.go-toolbar button {
+  background: none;
+  border: none;
+  color: var(--text, #f5f5f5);
+  cursor: pointer;
+  font-size: 13px;
+  height: 28px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.go-toolbar button:hover {
+  background: var(--bg-subtle, #1e1e1e);
+}
+.go-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border, #2a2a2a);
+  margin: 0 4px;
+}
+.go-zoom-pct {
+  min-width: 40px;
+  text-align: center;
+}
+.grid-overview-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint, #666);
+  font-size: 14px;
+}
+
 .ws-tabs-actions { display: inline-flex; gap: 4px; align-items: center; }
 .ws-focus-toggle {
   display: inline-flex;

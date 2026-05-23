@@ -32,7 +32,20 @@ if [ -d "$CHUNKS_DIR" ]; then
   done
 fi
 
-# 4. Clear icon cache
+# 4. Increase agent inactivity timeout (10min -> 30min)
+# See https://github.com/nexu-io/open-design/issues/1451
+CHUNKS_DIR="$RESOURCES/app/prebundled/daemon/chunks"
+if [ -d "$CHUNKS_DIR" ]; then
+  for chunk in "$CHUNKS_DIR"/chunk-*.mjs; do
+    if grep -q 'DEFAULT_CHAT_RUN_INACTIVITY_TIMEOUT_MS = 10 \* 60 \* 1e3' "$chunk" 2>/dev/null; then
+      sudo sed -i.bak 's/DEFAULT_CHAT_RUN_INACTIVITY_TIMEOUT_MS = 10 \* 60 \* 1e3/DEFAULT_CHAT_RUN_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1e3/' "$chunk"
+      sudo rm -f "$chunk.bak"
+      echo "  ✓ Increased agent timeout to 30min in $(basename "$chunk")"
+    fi
+  done
+fi
+
+# 5. Clear icon cache
 sudo rm -rf /Library/Caches/com.apple.iconservices.store 2>/dev/null || true
 sudo killall Dock 2>/dev/null || true
 

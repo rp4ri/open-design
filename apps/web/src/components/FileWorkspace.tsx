@@ -45,6 +45,7 @@ import {
 import { DesignFilesPanel } from './DesignFilesPanel';
 import type { PluginFolderAgentAction } from './design-files/pluginFolderActions';
 import { FileViewer, LiveArtifactViewer } from './FileViewer';
+import { GridOverviewPanel } from './GridOverviewPanel';
 import { Icon } from './Icon';
 import { LiveArtifactBadges } from './LiveArtifactBadges';
 import { PasteTextDialog } from './PasteTextDialog';
@@ -117,6 +118,7 @@ interface SketchState {
 
 const DESIGN_FILES_TAB = '__design_files__';
 const DESIGN_SYSTEM_TAB = '__design_system__';
+const GRID_OVERVIEW_TAB = '__grid_overview__';
 type TabDropEdge = 'before' | 'after';
 type DesignSystemReviewDecision =
   NonNullable<ProjectMetadata['designSystemReview']>[string]['decision'];
@@ -282,7 +284,7 @@ export function FileWorkspace({
   // back to the last remaining tab. Skip transient activeTab values
   // (DESIGN_FILES_TAB, pending sketches) since those aren't in persistedTabs.
   useEffect(() => {
-    if (activeTab === DESIGN_FILES_TAB || activeTab === DESIGN_SYSTEM_TAB) return;
+    if (activeTab === DESIGN_FILES_TAB || activeTab === DESIGN_SYSTEM_TAB || activeTab === GRID_OVERVIEW_TAB) return;
     if (sketches[activeTab] && !sketches[activeTab]!.persisted) return;
     if (!persistedTabs.includes(activeTab)) {
       setPersistedActive(persistedTabs[persistedTabs.length - 1] ?? null);
@@ -757,7 +759,7 @@ export function FileWorkspace({
   }
 
   const activeFile = useMemo<ProjectFile | null>(() => {
-    if (activeTab === DESIGN_FILES_TAB || activeTab === DESIGN_SYSTEM_TAB) return null;
+    if (activeTab === DESIGN_FILES_TAB || activeTab === DESIGN_SYSTEM_TAB || activeTab === GRID_OVERVIEW_TAB) return null;
     const onDisk = visibleFiles.find((f) => f.name === activeTab);
     if (onDisk) return onDisk;
     if (isSketchName(activeTab) && sketches[activeTab]) {
@@ -773,7 +775,7 @@ export function FileWorkspace({
   }, [activeTab, visibleFiles, sketches]);
 
   const activeLiveArtifact = useMemo<LiveArtifactWorkspaceEntry | null>(() => {
-    if (activeTab === DESIGN_FILES_TAB || activeTab === DESIGN_SYSTEM_TAB) return null;
+    if (activeTab === DESIGN_FILES_TAB || activeTab === DESIGN_SYSTEM_TAB || activeTab === GRID_OVERVIEW_TAB) return null;
     return liveArtifactEntries.find((entry) => entry.tabId === activeTab) ?? null;
   }, [activeTab, liveArtifactEntries]);
 
@@ -860,6 +862,21 @@ export function FileWorkspace({
               <Icon name="grid" size={13} />
             </span>
             <span className="ws-tab-label">{t('workspace.designFiles')}</span>
+          </button>
+          <button
+            type="button"
+            className={`ws-tab grid-overview-tab ${activeTab === GRID_OVERVIEW_TAB ? 'active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === GRID_OVERVIEW_TAB}
+            tabIndex={0}
+            data-testid="grid-overview-tab"
+            onClick={() => setActiveTab(GRID_OVERVIEW_TAB)}
+            title="Grid Overview"
+          >
+            <span className="tab-icon" aria-hidden>
+              <Icon name="present" size={13} />
+            </span>
+            <span className="ws-tab-label">Overview</span>
           </button>
           {tabNames.map((name) => {
             const sketchEntry = sketches[name];
@@ -1016,6 +1033,12 @@ export function FileWorkspace({
             onPluginFolderAgentAction={onPluginFolderAgentAction}
             activePluginActionPaths={activePluginActionPaths}
             hiddenPluginActionPaths={hiddenPluginActionPaths}
+          />
+        ) : activeTab === GRID_OVERVIEW_TAB ? (
+          <GridOverviewPanel
+            projectId={projectId}
+            files={visibleFiles}
+            onOpenFile={openFile}
           />
         ) : isActiveSketch && activeSketch && activeFile ? (
           activeSketch.loaded ? (
