@@ -2,6 +2,9 @@ import { expect, test } from '@playwright/test';
 import type { Locator, Page } from '@playwright/test';
 
 const STORAGE_KEY = 'open-design:config';
+const OPEN_SETTINGS_LABEL = /Open settings|打开设置|開啟設定/i;
+
+test.describe.configure({ timeout: 30_000 });
 
 const CONNECTORS = [
   {
@@ -48,6 +51,28 @@ function baseConfig(): Record<string, unknown> {
 
 function connectorCard(scope: Page | Locator, id: string) {
   return scope.locator(`article.connector-card[data-connector-id="${id}"]`);
+}
+
+async function waitForLoadingToClear(page: Page) {
+  await expect(page.getByText('Loading Open Design…')).toHaveCount(0, { timeout: 15_000 });
+}
+
+async function gotoEntryHome(page: Page) {
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await waitForLoadingToClear(page);
+  const privacyDialog = page.getByRole('dialog').filter({ hasText: 'Help us improve Open Design' });
+  if (await privacyDialog.isVisible()) {
+    await privacyDialog.getByRole('button', { name: /not now/i }).click();
+  }
+  await expect(page.getByTestId('home-hero')).toBeVisible();
+}
+
+async function openSettingsDialogFromEntry(page: Page) {
+  await waitForLoadingToClear(page);
+  await page.getByRole('button', { name: OPEN_SETTINGS_LABEL }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  return dialog;
 }
 
 async function openConnectorsSettings(
@@ -118,6 +143,14 @@ async function openConnectorsSettings(
     });
   });
 
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ json: { config: baseConfig() } });
+      return;
+    }
+    await route.fulfill({ json: { ok: true } });
+  });
+
   await page.route('**/api/connectors', async (route) => {
     await route.fulfill({ json: { connectors } });
   });
@@ -174,12 +207,9 @@ async function openConnectorsSettings(
     });
   });
 
-  await page.goto('/');
-  await page.getByTitle('Configure execution mode').click();
-
-  const dialog = page.getByRole('dialog');
-  await expect(dialog).toBeVisible();
-  await dialog.getByRole('button', { name: /^Connectors\b/ }).click();
+  await gotoEntryHome(page);
+  const dialog = await openSettingsDialogFromEntry(page);
+  await dialog.getByRole('button', { name: /Connectors|连接器/i }).click();
   await expect(dialog.getByTestId('connector-grid-wrap')).toBeVisible();
   await expect(connectorCard(dialog, 'github')).toBeVisible();
   return dialog;
@@ -199,9 +229,7 @@ test.describe('Settings connectors auth happy path', () => {
     const githubCard = connectorCard(dialog, 'github');
     await githubCard.getByRole('button', { name: 'Connect' }).click();
 
-    await expect(githubCard.getByRole('alert')).toContainText(
-      'Composio provider is not configured',
-    );
+    await expect(dialog.getByText('Composio provider is not configured')).toBeVisible();
     await expect(githubCard.getByRole('button', { name: 'Connect' })).toBeVisible();
   });
 
@@ -235,15 +263,13 @@ test.describe('Settings connectors auth happy path', () => {
     const githubCard = connectorCard(dialog, 'github');
 
     await githubCard.getByRole('button', { name: 'Connect' }).click();
-    await expect(githubCard.getByRole('alert')).toContainText(
-      'Composio provider is not configured',
-    );
+    await expect(dialog.getByText('Composio provider is not configured')).toBeVisible();
 
     await githubCard.getByRole('button', { name: 'Connect' }).click();
 
     await expect.poll(() => connectAttempts).toBe(2);
     await expect(githubCard.getByRole('button', { name: 'Disconnect' })).toBeVisible();
-    await expect(githubCard.getByRole('alert')).toHaveCount(0);
+    await expect(dialog.getByText('Composio provider is not configured')).toHaveCount(0);
   });
 
   test('switches from Connect to Disconnect on success, then returns to Connect after a successful disconnect', async ({ page }) => {

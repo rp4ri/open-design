@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode, type WheelEvent } from 'react';
 
 import { Icon } from './Icon';
 import type { PreviewVisualMarkKind } from '../types';
@@ -138,6 +138,13 @@ export function PreviewDrawOverlay({
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
 
+  function activePreviewIframe(): HTMLIFrameElement | null {
+    return (
+      wrapRef.current?.querySelector<HTMLIFrameElement>('iframe[data-od-active="true"]') ??
+      wrapRef.current?.querySelector<HTMLIFrameElement>('iframe')
+    ) ?? null;
+  }
+
   function onPointerDown(e: PointerEvent) {
     if (mode !== 'draw' || sending) return;
     (e.target as Element).setPointerCapture?.(e.pointerId);
@@ -159,12 +166,29 @@ export function PreviewDrawOverlay({
     redraw();
   }
 
+  function onCanvasWheel(e: WheelEvent<HTMLCanvasElement>) {
+    if (mode !== 'draw' || sending) return;
+    const iframe = activePreviewIframe();
+    const win = iframe?.contentWindow;
+    if (!win || typeof win.scrollBy !== 'function') return;
+    e.preventDefault();
+    win.scrollBy({ left: e.deltaX, top: e.deltaY, behavior: 'auto' });
+  }
+
   function clearInk() {
     strokesRef.current = [];
     drawingRef.current = null;
     setHasInk(false);
     redraw();
   }
+
+  useEffect(() => {
+    if (active) return;
+    strokesRef.current = [];
+    drawingRef.current = null;
+    setHasInk(false);
+    redraw();
+  }, [active, redraw]);
 
   function strokeBounds(): { x: number; y: number; width: number; height: number } | null {
     const points = strokesRef.current.flatMap((stroke) => stroke.points);
@@ -206,7 +230,7 @@ export function PreviewDrawOverlay({
   }
 
   async function requestSnapshot(): Promise<{ dataUrl: string; w: number; h: number } | null> {
-    const iframe = wrapRef.current?.querySelector('iframe') as HTMLIFrameElement | null;
+    const iframe = activePreviewIframe();
     if (!iframe) return null;
     return requestPreviewSnapshot(iframe);
   }
@@ -253,7 +277,7 @@ export function PreviewDrawOverlay({
   }
 
   async function compositeWithBackground(snap: { dataUrl: string; w: number; h: number }): Promise<Blob | null> {
-    const iframe = wrapRef.current?.querySelector('iframe');
+    const iframe = activePreviewIframe();
     if (!iframe) return null;
     const rect = iframe.getBoundingClientRect();
     const out = document.createElement('canvas');
@@ -294,7 +318,6 @@ export function PreviewDrawOverlay({
     const hasTarget = Boolean(captureTarget);
     const shouldCapture = hasInk || hasTarget;
     const canSubmit = shouldCapture || Boolean(note.trim());
-    if (action === 'send' && sendDisabled) return;
     if (sending || !canSubmit) return;
     setPendingAction(action);
     try {
@@ -346,7 +369,7 @@ export function PreviewDrawOverlay({
   const overlayPointer = mode === 'draw' ? 'auto' : 'none';
   const showCanvas = active || mode === 'draw' || hasInk;
   const canSubmit = hasInk || Boolean(captureTarget) || Boolean(note.trim());
-  const canSend = canSubmit && !sendDisabled;
+  const canSend = canSubmit;
 
   return (
     <div
@@ -366,6 +389,7 @@ export function PreviewDrawOverlay({
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
+          onWheel={onCanvasWheel}
           style={{
             position: 'absolute',
             inset: 0,
@@ -457,27 +481,26 @@ export function PreviewDrawOverlay({
               'Queue'
             )}
           </button>
-          {!sendDisabled ? (
-            <button
-              type="button"
-              onClick={() => void send('send')}
-              disabled={sending || !canSend}
-              style={{
-                ...pillStyle(true),
-                opacity: canSend ? 1 : 0.4,
-                cursor: sending ? 'wait' : (canSend ? 'pointer' : 'not-allowed'),
-              }}
-            >
-              {pendingAction === 'send' ? (
-                <>
-                  <Icon name="spinner" size={12} />
-                  <span>Sending...</span>
-                </>
-              ) : (
-                'Send'
-              )}
-            </button>
-          ) : null}
+          <button
+            type="button"
+            onClick={() => void send('send')}
+            disabled={sending || !canSend}
+            title={sendDisabled ? sendDisabledReason : undefined}
+            style={{
+              ...pillStyle(true),
+              opacity: canSend ? 1 : 0.4,
+              cursor: sending ? 'wait' : (canSend ? 'pointer' : 'not-allowed'),
+            }}
+          >
+            {pendingAction === 'send' ? (
+              <>
+                <Icon name="spinner" size={12} />
+                <span>Sending...</span>
+              </>
+            ) : (
+              'Send'
+            )}
+          </button>
         </div>
       ) : null}
     </div>

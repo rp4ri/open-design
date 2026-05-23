@@ -1,7 +1,7 @@
 import { execAgentFile } from './invocation.js';
 import { AGENT_DEFS } from './registry.js';
 import { DEFAULT_MODEL_OPTION, rememberLiveModels } from './models.js';
-import { resolveAgentExecutable } from './executables.js';
+import { applyAgentLaunchEnv, resolveAgentLaunch } from './launch.js';
 import { spawnEnvForAgent } from './env.js';
 import { probeAgentAuthStatus } from './auth.js';
 import { agentCapabilities } from './capabilities.js';
@@ -10,24 +10,34 @@ import type {
   DetectedAgent,
   RuntimeAgentDef,
   RuntimeCapabilityMap,
+  RuntimeModelSource,
   RuntimeModelOption,
 } from './types.js';
+
+type FetchedRuntimeModels = {
+  models: RuntimeModelOption[];
+  source: RuntimeModelSource;
+};
 
 async function fetchModels(
   def: RuntimeAgentDef,
   resolvedBin: string,
   env: NodeJS.ProcessEnv,
-): Promise<RuntimeModelOption[]> {
+): Promise<FetchedRuntimeModels> {
   if (typeof def.fetchModels === 'function') {
     try {
       const parsed = await def.fetchModels(resolvedBin, env);
-      if (!parsed || parsed.length === 0) return def.fallbackModels;
-      return parsed;
+      if (!parsed || parsed.length === 0) {
+        return { models: def.fallbackModels, source: 'fallback' };
+      }
+      return { models: parsed, source: 'live' };
     } catch {
-      return def.fallbackModels;
+      return { models: def.fallbackModels, source: 'fallback' };
     }
   }
-  if (!def.listModels) return def.fallbackModels;
+  if (!def.listModels) {
+    return { models: def.fallbackModels, source: 'fallback' };
+  }
   try {
     const { stdout } = await execAgentFile(resolvedBin, def.listModels.args, {
       env,
@@ -41,10 +51,12 @@ async function fetchModels(
     // Empty / null parse result means the CLI didn't actually return a
     // usable list (e.g. cursor-agent's "No models available"); fall back
     // to the static hint so the picker isn't stuck on Default-only.
-    if (!parsed || parsed.length === 0) return def.fallbackModels;
-    return parsed;
+    if (!parsed || parsed.length === 0) {
+      return { models: def.fallbackModels, source: 'fallback' };
+    }
+    return { models: parsed, source: 'live' };
   } catch {
-    return def.fallbackModels;
+    return { models: def.fallbackModels, source: 'fallback' };
   }
 }
 
@@ -88,7 +100,7 @@ async function probeVersionAtPath(
   try {
     const { stdout } = await execAgentFile(resolved, def.versionArgs, {
       env,
-      timeout: 3000,
+      timeout: def.versionProbeTimeoutMs ?? 3000,
     });
     const version = String(stdout).trim().split('\n')[0] ?? null;
     return { kind: 'spawned', version };
@@ -109,6 +121,7 @@ function unavailableAgent(def: RuntimeAgentDef): DetectedAgent {
   return {
     ...stripFns(def),
     models: def.fallbackModels ?? [DEFAULT_MODEL_OPTION],
+    modelsSource: 'fallback',
     available: false,
     ...installMetaForAgent(def.id),
   };
@@ -118,27 +131,30 @@ async function probe(
   def: RuntimeAgentDef,
   configuredEnv: Record<string, string> = {},
 ): Promise<DetectedAgent> {
-  // Resolution returns whichever path the rest of the daemon will spawn
-  // (configured override wins, PATH fallback otherwise). Detection must
-  // probe THAT path and report `available` accordingly, so the Settings
-  // UI never advertises an executable that `resolveAgentBin` won't pick
-  // at run time. Surfacing a different PATH candidate as `available: true`
-  // while a stale configured override survives in chat/run resolution
-  // breaks the invariant flagged on PR #1301 review and would only swap
-  // the ghost in Settings for a ghost in chat (Siri-Ray, #1301 round 3).
-  const resolved = resolveAgentExecutable(def, configuredEnv);
-  if (!resolved) {
+  // Detection must probe the exact path the runtime will spawn, not just the
+  // PATH-visible shim. This is load-bearing for Codex under nvm/fnm/mise:
+  // the discovered `codex` entry is often a `#!/usr/bin/env node` wrapper
+  // that is not invocable from a GUI-launched app's stripped PATH, while the
+  // launch resolver can still upgrade it to the packaged native Codex binary.
+  // If detection probes the shim but chat/run spawns the native binary, the
+  // UI incorrectly reports "not installed" until the user pins CODEX_BIN by
+  // hand even though the real launch path is healthy.
+  const launch = resolveAgentLaunch(def, configuredEnv);
+  if (!launch.selectedPath || !launch.launchPath) {
     return unavailableAgent(def);
   }
-  const probeEnv = spawnEnvForAgent(
-    def.id,
-    {
-      ...process.env,
-      ...(def.env || {}),
-    },
-    configuredEnv,
+  const probeEnv = applyAgentLaunchEnv(
+    spawnEnvForAgent(
+      def.id,
+      {
+        ...process.env,
+        ...(def.env || {}),
+      },
+      configuredEnv,
+    ),
+    launch,
   );
-  const outcome = await probeVersionAtPath(def, resolved, probeEnv);
+  const outcome = await probeVersionAtPath(def, launch.launchPath, probeEnv);
   if (outcome.kind === 'not-invocable') {
     return unavailableAgent(def);
   }
@@ -147,7 +163,7 @@ async function probe(
   if (def.helpArgs && def.capabilityFlags) {
     const caps: RuntimeCapabilityMap = {};
     try {
-      const { stdout } = await execAgentFile(resolved, def.helpArgs, {
+      const { stdout } = await execAgentFile(launch.launchPath, def.helpArgs, {
         env: probeEnv,
         timeout: 5000,
         maxBuffer: 4 * 1024 * 1024,
@@ -161,13 +177,14 @@ async function probe(
     }
     agentCapabilities.set(def.id, caps);
   }
-  const models = await fetchModels(def, resolved, probeEnv);
-  const auth = await probeAgentAuthStatus(def.id, resolved, probeEnv);
+  const modelResult = await fetchModels(def, launch.launchPath, probeEnv);
+  const auth = await probeAgentAuthStatus(def.id, launch.launchPath, probeEnv);
   return {
     ...stripFns(def),
-    models,
+    models: modelResult.models,
+    modelsSource: modelResult.source,
     available: true,
-    path: resolved,
+    path: launch.selectedPath,
     version: outcome.version,
     ...(auth
       ? {
@@ -181,7 +198,7 @@ async function probe(
 
 function stripFns(
   def: RuntimeAgentDef,
-): Omit<DetectedAgent, 'models' | 'available' | 'path' | 'version'> {
+): Omit<DetectedAgent, 'models' | 'modelsSource' | 'available' | 'path' | 'version'> {
   // Drop the buildArgs / listModels closures but keep declarative metadata
   // (reasoningOptions, streamFormat, name, bin, etc.). `models` is
   // populated separately by `fetchModels`, so we strip the static
@@ -196,6 +213,7 @@ function stripFns(
     helpArgs,
     capabilityFlags,
     fallbackBins,
+    versionProbeTimeoutMs,
     maxPromptArgBytes,
     env,
     ...rest
@@ -203,11 +221,29 @@ function stripFns(
   return rest;
 }
 
+async function safeProbe(
+  def: RuntimeAgentDef,
+  configuredEnv: Record<string, string> = {},
+): Promise<DetectedAgent> {
+  try {
+    return await probe(def, configuredEnv);
+  } catch {
+    // Fault isolation (issue #2297): one adapter's probe blowing up
+    // — e.g. a synchronous filesystem throw during PATH walking on a
+    // packaged Windows daemon, or an async rejection from one of the
+    // post-launch probes — must not collapse the whole agent picker.
+    // Without this guard the bare `Promise.all` rejected and the
+    // `/api/agents` catch arm returned `[]`, so the UI silently lost
+    // every CLI option and fell back to BYOK / Cloud only.
+    return unavailableAgent(def);
+  }
+}
+
 export async function detectAgents(
   configuredEnvByAgent: Record<string, Record<string, string>> = {},
 ) {
   const results = await Promise.all(
-    AGENT_DEFS.map((def) => probe(def, configuredEnvByAgent?.[def.id] ?? {})),
+    AGENT_DEFS.map((def) => safeProbe(def, configuredEnvByAgent?.[def.id] ?? {})),
   );
   // Refresh the validation cache from whatever we just surfaced to the UI
   // so /api/chat can accept any model the user could have just picked,

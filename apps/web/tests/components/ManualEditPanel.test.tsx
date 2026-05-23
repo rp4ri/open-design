@@ -3,8 +3,8 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Simulate } from 'react-dom/test-utils';
 import { JSDOM } from 'jsdom';
-import { ManualEditPanel, emptyManualEditDraft, manualEditPatchSummary, normalizeManualEditStyles } from '../../src/components/ManualEditPanel';
-import { emptyManualEditStyles, type ManualEditTarget } from '../../src/edit-mode/types';
+import { ManualEditPanel, emptyManualEditDraft, manualEditPatchSummary, normalizeManualEditStyles, type ManualEditDraft } from '../../src/components/ManualEditPanel';
+import { emptyManualEditStyles, type ManualEditPatch, type ManualEditStyles, type ManualEditTarget } from '../../src/edit-mode/types';
 
 const target: ManualEditTarget = {
   id: 'hero-title',
@@ -20,6 +20,13 @@ const target: ManualEditTarget = {
   isLayoutContainer: false,
   outerHtml: '<h1 data-od-id="hero-title">Original</h1>',
 };
+
+type OnDraftChange = (draft: ManualEditDraft) => void;
+type OnStyleChange = (id: string, styles: Partial<ManualEditStyles>, label: string) => void;
+type OnInvalidStyle = (id: string, keys: Array<keyof ManualEditStyles>) => void;
+type OnApplyPatch = (patch: ManualEditPatch, label: string) => void;
+type OnError = (message: string) => void;
+type OnClearSelection = () => void;
 
 describe('ManualEditPanel', () => {
   let dom: JSDOM;
@@ -45,12 +52,57 @@ describe('ManualEditPanel', () => {
     Reflect.deleteProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT');
   });
 
-  it('renders the style inspector without the advanced editor entry', () => {
+  it('restores manual edit tabs for content, HTML, and source edits', () => {
     renderPanel();
 
     expect(host.textContent).toContain('TYPOGRAPHY');
-    expect(host.textContent).not.toContain('Advanced');
-    expect(host.textContent).not.toContain('Content');
+    expect(host.textContent).toContain('Content');
+    expect(host.textContent).toContain('HTML');
+    expect(host.textContent).toContain('Source');
+  });
+
+  it('applies selected-element HTML from the manual edit panel', () => {
+    const onApplyPatch = vi.fn();
+    renderPanel({
+      onApplyPatch,
+      outerHtml: '<h1 data-od-id="hero-title">Updated</h1>',
+    });
+
+    clickTab('HTML');
+    const htmlArea = host.querySelector('.manual-edit-code.tall') as HTMLTextAreaElement | null;
+    if (!htmlArea) throw new Error('HTML editor not found');
+    expect(htmlArea.value).toBe('<h1 data-od-id="hero-title">Updated</h1>');
+    const apply = buttonByText('Apply HTML');
+    act(() => {
+      apply.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(onApplyPatch).toHaveBeenCalledWith(
+      { id: 'hero-title', kind: 'set-outer-html', html: '<h1 data-od-id="hero-title">Updated</h1>' },
+      'HTML: Hero Title',
+    );
+  });
+
+  it('applies full source edits from the manual edit panel', () => {
+    const onApplyPatch = vi.fn();
+    renderPanel({
+      onApplyPatch,
+      fullSource: '<html><body><h1>Updated source</h1></body></html>',
+    });
+
+    clickTab('Source');
+    const sourceArea = host.querySelector('.manual-edit-code.tall') as HTMLTextAreaElement | null;
+    if (!sourceArea) throw new Error('Source editor not found');
+    expect(sourceArea.value).toBe('<html><body><h1>Updated source</h1></body></html>');
+    const apply = buttonByText('Apply Source');
+    act(() => {
+      apply.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(onApplyPatch).toHaveBeenCalledWith(
+      { kind: 'set-full-source', source: '<html><body><h1>Updated source</h1></body></html>' },
+      'Full source',
+    );
   });
 
   it('allows returning from an element inspector to the page inspector', () => {
@@ -428,35 +480,53 @@ describe('ManualEditPanel', () => {
     return section;
   }
 
+  function buttonByText(text: string): HTMLButtonElement {
+    const button = Array.from(host.querySelectorAll('button'))
+      .find((candidate) => candidate.textContent === text) as HTMLButtonElement | undefined;
+    if (!button) throw new Error(`${text} button not found`);
+    return button;
+  }
+
+  function clickTab(text: string) {
+    const button = buttonByText(text);
+    act(() => {
+      button.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+    });
+  }
+
   function renderPanel({
-    onDraftChange = vi.fn(),
-    onApplyPatch = vi.fn(),
-    onError = vi.fn(),
-    onStyleChange = vi.fn(),
-    onInvalidStyle = vi.fn(),
-    onClearSelection = vi.fn(),
+    onDraftChange = vi.fn<OnDraftChange>(),
+    onApplyPatch = vi.fn<OnApplyPatch>(),
+    onError = vi.fn<OnError>(),
+    onStyleChange = vi.fn<OnStyleChange>(),
+    onInvalidStyle = vi.fn<OnInvalidStyle>(),
+    onClearSelection = vi.fn<OnClearSelection>(),
     attributesText = '{}',
     selectedTarget = target,
     styles = emptyManualEditStyles(),
     pageStylesEnabled = true,
+    outerHtml = target.outerHtml,
+    fullSource = '<html></html>',
   }: {
-    onDraftChange?: ReturnType<typeof vi.fn>;
-    onApplyPatch?: ReturnType<typeof vi.fn>;
-    onError?: ReturnType<typeof vi.fn>;
-    onStyleChange?: ReturnType<typeof vi.fn>;
-    onInvalidStyle?: ReturnType<typeof vi.fn>;
-    onClearSelection?: ReturnType<typeof vi.fn>;
+    onDraftChange?: OnDraftChange;
+    onApplyPatch?: OnApplyPatch;
+    onError?: OnError;
+    onStyleChange?: OnStyleChange;
+    onInvalidStyle?: OnInvalidStyle;
+    onClearSelection?: OnClearSelection;
     attributesText?: string;
     selectedTarget?: ManualEditTarget | null;
     styles?: ReturnType<typeof emptyManualEditStyles>;
     pageStylesEnabled?: boolean;
+    outerHtml?: string;
+    fullSource?: string;
   } = {}) {
     const draft = {
-      ...emptyManualEditDraft('<html></html>'),
+      ...emptyManualEditDraft(fullSource),
       text: 'Updated copy',
       attributesText,
       styles,
-      outerHtml: target.outerHtml,
+      outerHtml,
     };
     act(() => {
       root.render(
@@ -469,16 +539,16 @@ describe('ManualEditPanel', () => {
           canUndo={false}
           canRedo={false}
           pageStylesEnabled={pageStylesEnabled}
-          onSelectTarget={vi.fn()}
+          onSelectTarget={vi.fn<(target: ManualEditTarget) => void>()}
           onDraftChange={onDraftChange}
           onStyleChange={onStyleChange}
           onInvalidStyle={onInvalidStyle}
           onApplyPatch={onApplyPatch}
           onError={onError}
           onClearSelection={onClearSelection}
-          onCancelDraft={vi.fn()}
-          onUndo={vi.fn()}
-          onRedo={vi.fn()}
+          onCancelDraft={vi.fn<() => void>()}
+          onUndo={vi.fn<() => void>()}
+          onRedo={vi.fn<() => void>()}
         />,
       );
     });

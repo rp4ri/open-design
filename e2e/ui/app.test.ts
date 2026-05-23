@@ -1,5 +1,9 @@
 import { expect, test } from '@playwright/test';
 import type { Dialog, Page, Request, Response } from '@playwright/test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { T } from '@/timeouts';
 import { automatedUiScenarios } from '@/playwright/resources';
 import type { UiScenario } from '@/playwright/resources';
 
@@ -8,7 +12,11 @@ const APP_OWNED_SCENARIO_FLOWS = new Set([
   'design-files-upload',
   'design-files-delete',
   'design-files-tab-persistence',
+  'uploaded-image-renders-in-preview',
+  'python-source-preview',
+  'example-use-prompt',
 ]);
+test.describe.configure({ timeout: 45_000 });
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript((key) => {
@@ -24,9 +32,31 @@ test.beforeEach(async ({ page }) => {
         designSystemId: null,
         onboardingCompleted: true,
         agentModels: {},
+        privacyDecisionAt: 1,
+        telemetry: { metrics: false, content: false, artifactManifest: false },
       }),
     );
   }, STORAGE_KEY);
+
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue();
+      return;
+    }
+    await route.fulfill({
+      json: {
+        config: {
+          onboardingCompleted: true,
+          agentId: 'mock',
+          skillId: null,
+          designSystemId: null,
+          agentModels: {},
+          privacyDecisionAt: 1,
+          telemetry: { metrics: false, content: false, artifactManifest: false },
+        },
+      },
+    });
+  });
 });
 
 for (const entry of automatedUiScenarios().filter(
@@ -49,24 +79,6 @@ for (const entry of automatedUiScenarios().filter(
         },
       });
     });
-
-    if (entry.flow === 'design-system-selection') {
-      await page.route('**/api/design-systems', async (route) => {
-        await route.fulfill({
-          json: {
-            designSystems: [
-              {
-                id: 'nexu-soft-tech',
-                title: 'Nexu Soft Tech',
-                category: 'Product',
-                summary: 'Warm utility system for product interfaces.',
-                swatches: ['#F7F4EE', '#D6CBBF', '#1F2937', '#D97757'],
-              },
-            ],
-          },
-        });
-      });
-    }
 
     if (entry.flow === 'example-use-prompt') {
       const exampleSummary = {
@@ -98,6 +110,47 @@ for (const entry of automatedUiScenarios().filter(
       // gallery card the test clicks actually renders.
       await page.route('**/api/design-templates', async (route) => {
         await route.fulfill({ json: { designTemplates: [exampleSummary] } });
+      });
+    }
+
+    if (entry.flow === 'hyperframes-project-routing') {
+      await page.route('**/api/skills', async (route) => {
+        await route.fulfill({
+          json: {
+            skills: [
+              {
+                id: 'video-shortform',
+                name: 'Video shortform',
+                description: 'Shortform video skill',
+                mode: 'video',
+                surface: 'video',
+                previewType: 'video',
+                designSystemRequired: false,
+                defaultFor: [],
+                triggers: [],
+                upstream: null,
+                hasBody: true,
+                examplePrompt: '',
+                aggregatesExamples: false,
+              },
+              {
+                id: 'hyperframes',
+                name: 'HyperFrames',
+                description: 'HTML-in-canvas video',
+                mode: 'video',
+                surface: 'video',
+                previewType: 'video',
+                designSystemRequired: false,
+                defaultFor: [],
+                triggers: [],
+                upstream: null,
+                hasBody: true,
+                examplePrompt: '',
+                aggregatesExamples: false,
+              },
+            ],
+          },
+        });
       });
     }
 
@@ -239,17 +292,36 @@ for (const entry of automatedUiScenarios().filter(
       });
     }
 
-    await page.goto('/');
-
-    if (entry.flow === 'design-system-selection') {
-      await runDesignSystemSelectionFlow(page, entry);
-      return;
+    if (entry.flow === 'file-mention') {
+      await routeMockSuccessfulRun(page, 'file-mention-run');
     }
+
+    await gotoEntryHome(page);
+
     if (entry.flow === 'example-use-prompt') {
       await runExampleUsePromptFlow(page, entry);
       return;
     }
-
+    if (entry.flow === 'hyperframes-project-routing') {
+      await runHyperframesProjectRoutingFlow(page, entry);
+      return;
+    }
+    if (entry.flow === 'image-project-routing') {
+      await runImageProjectRoutingFlow(page, entry);
+      return;
+    }
+    if (entry.flow === 'video-project-routing') {
+      await runVideoProjectRoutingFlow(page, entry);
+      return;
+    }
+    if (entry.flow === 'audio-project-routing') {
+      await runAudioProjectRoutingFlow(page, entry);
+      return;
+    }
+    if (entry.flow === 'live-artifact-project-routing') {
+      await runLiveArtifactProjectRoutingFlow(page, entry);
+      return;
+    }
     await createProject(page, entry);
     await expectWorkspaceReady(page);
 
@@ -302,6 +374,8 @@ for (const entry of automatedUiScenarios().filter(
     if (entry.mockArtifact) {
       await expectArtifactVisible(page, entry);
     }
+    const { projectId } = await getCurrentProjectContext(page);
+    await expectScenarioProjectState(page, entry, projectId);
   });
 }
 
@@ -324,9 +398,42 @@ async function routeMockAgents(page: Page) {
   });
 }
 
+async function routeMockSuccessfulRun(page: Page, runId: string) {
+  await page.route('**/api/runs', async (route) => {
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ runId }),
+    });
+  });
+  await page.route('**/api/runs/*/events', async (route) => {
+    const body = [
+      'event: start',
+      'data: {"bin":"mock-agent"}',
+      '',
+      'event: stdout',
+      'data: {"chunk":"Plugin flow completed."}',
+      '',
+      'event: end',
+      'data: {"code":0,"status":"succeeded"}',
+      '',
+      '',
+    ].join('\n');
+
+    await route.fulfill({
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+      },
+      body,
+    });
+  });
+}
+
 async function createEmptyProject(page: Page, name: string): Promise<string> {
-  await page.goto('/');
-  await expect(page.getByTestId('new-project-panel')).toBeVisible();
+  await gotoEntryHome(page);
+  await openNewProjectModal(page);
   await page.getByTestId('new-project-name').fill(name);
   await page.getByTestId('create-project').click();
   await expect(page).toHaveURL(/\/projects\//);
@@ -429,51 +536,32 @@ async function createProject(
 }
 
 async function expectWorkspaceReady(page: Page) {
+  await waitForLoadingToClear(page);
   await expect(page).toHaveURL(/\/projects\//);
   await expect(page.getByTestId('chat-composer')).toBeVisible();
   await expect(page.getByTestId('chat-composer-input')).toBeVisible();
   await expect(page.getByTestId('file-workspace')).toBeVisible();
 }
 
-async function sendPrompt(
-  page: Page,
-  prompt: string,
-) {
+async function expectProjectShellReady(page: Page) {
+  await waitForLoadingToClear(page);
+  await expect(page).toHaveURL(/\/projects\//);
+  await expect(page.getByTestId('chat-composer')).toBeVisible();
+  await expect(page.getByTestId('file-workspace')).toBeVisible();
+}
+
+async function sendPrompt(page: Page, prompt: string) {
   const input = page.getByTestId('chat-composer-input');
   const sendButton = page.getByTestId('chat-send');
-  for (let attempt = 0; attempt < 3; attempt++) {
-    await input.click();
-    await input.fill(prompt);
-    try {
-      await expect(input).toHaveValue(prompt, { timeout: 1500 });
-      await expect(sendButton).toBeEnabled({ timeout: 1500 });
-      const chatResponse = page.waitForResponse(
-        isCreateRunResponse,
-        { timeout: 2000 },
-      );
-      await sendButton.evaluate((button: HTMLButtonElement) => button.click());
-      await chatResponse;
-      return;
-    } catch (error) {
-      await input.click();
-      await input.press(`${process.platform === 'darwin' ? 'Meta' : 'Control'}+A`);
-      await input.press('Backspace');
-      await input.pressSequentially(prompt);
-      try {
-        await expect(input).toHaveValue(prompt, { timeout: 1500 });
-        await expect(sendButton).toBeEnabled({ timeout: 1500 });
-        const chatResponse = page.waitForResponse(
-          isCreateRunResponse,
-          { timeout: 2000 },
-        );
-        await sendButton.evaluate((button: HTMLButtonElement) => button.click());
-        await chatResponse;
-        return;
-      } catch (retryError) {
-        if (attempt === 2) throw retryError;
-      }
-    }
-  }
+  await expect(input).toBeVisible({ timeout: T.short });
+  await input.click();
+  await input.fill(prompt);
+  await expect(input).toHaveValue(prompt, { timeout: T.short });
+  await expect(sendButton).toBeEnabled({ timeout: T.short });
+  await Promise.all([
+    page.waitForResponse(isCreateRunResponse, { timeout: 5_000 }),
+    sendButton.evaluate((button: HTMLButtonElement) => button.click()),
+  ]);
 }
 
 function isCreateRunResponse(resp: Response): boolean {
@@ -481,34 +569,33 @@ function isCreateRunResponse(resp: Response): boolean {
   return url.pathname === '/api/runs' && resp.request().method() === 'POST';
 }
 
+function isCreateProjectResponse(resp: Response): boolean {
+  const url = new URL(resp.url());
+  return url.pathname === '/api/projects' && resp.request().method() === 'POST';
+}
+
 function isCreateRunRequest(request: Request): boolean {
   const url = new URL(request.url());
   return url.pathname === '/api/runs' && request.method() === 'POST';
 }
 
-async function runDesignSystemSelectionFlow(
-  page: Page,
-  entry: UiScenario,
-) {
-  await createProjectNameOnly(page, entry);
-  await page.getByTestId('design-system-trigger').click();
-  await expect(page.getByTestId('design-system-search')).toBeVisible();
-  await page.getByTestId('design-system-search').fill('Nexu');
-  await page.getByRole('option', { name: /Nexu Soft Tech/i }).click();
-  await expect(page.getByTestId('design-system-trigger')).toContainText('Nexu Soft Tech');
-  await page.getByTestId('create-project').click();
-
-  await expect(page).toHaveURL(/\/projects\//);
-  await expect(page.getByTestId('project-meta')).toContainText('Nexu Soft Tech');
-  await expect(page.getByTestId('chat-composer')).toBeVisible();
+function isCreateProjectRequest(request: Request): boolean {
+  const url = new URL(request.url());
+  return url.pathname === '/api/projects' && request.method() === 'POST';
 }
 
 async function runExampleUsePromptFlow(
   page: Page,
   entry: UiScenario,
 ) {
-  await page.getByTestId('entry-tab-templates').click();
-  await expect(page.getByTestId('example-card-warm-utility-example')).toBeVisible();
+  const exampleCard = page.getByTestId('example-card-warm-utility-example');
+  if ((await exampleCard.count()) === 0) {
+    const examplesTab = page.getByTestId('entry-tab-examples');
+    if ((await examplesTab.count()) > 0) {
+      await examplesTab.click();
+    }
+  }
+  await expect(exampleCard).toBeVisible();
   await page.getByTestId('example-use-prompt-warm-utility-example').click();
 
   await expect(page).toHaveURL(/\/projects\//);
@@ -517,6 +604,165 @@ async function runExampleUsePromptFlow(
   await expect(page.getByTestId('project-title')).toContainText('Warm Utility Example');
   await expect(page.getByTestId('project-meta')).toContainText('Warm Utility Example');
 }
+
+async function runHyperframesProjectRoutingFlow(
+  page: Page,
+  entry: UiScenario,
+) {
+  await createProjectNameOnly(page, entry);
+
+  const createProjectRequest = page.waitForRequest(isCreateProjectRequest);
+  const createProjectResponse = page.waitForResponse(isCreateProjectResponse);
+  await page.getByTestId('create-project').click();
+
+  const request = await createProjectRequest;
+  const body = request.postDataJSON() as {
+    skillId?: string;
+    metadata?: {
+      kind?: string;
+      videoModel?: string;
+    };
+  };
+  expect(body.skillId).toBe('hyperframes');
+  expect(body.metadata?.kind).toBe('video');
+  expect(body.metadata?.videoModel).toBe('hyperframes-html');
+
+  const response = await createProjectResponse;
+  expect(response.ok(), `${response.status()} ${await response.text()}`).toBeTruthy();
+
+  await expectWorkspaceReady(page);
+  await sendPrompt(page, entry.prompt);
+  await expectArtifactVisible(page, entry);
+  const { projectId } = await getCurrentProjectContext(page);
+  await expectScenarioProjectState(page, entry, projectId);
+}
+
+async function runImageProjectRoutingFlow(
+  page: Page,
+  entry: UiScenario,
+) {
+  await createProjectNameOnly(page, entry);
+
+  const createProjectRequest = page.waitForRequest(isCreateProjectRequest);
+  const createProjectResponse = page.waitForResponse(isCreateProjectResponse);
+  await page.getByTestId('create-project').click();
+
+  const request = await createProjectRequest;
+  const body = request.postDataJSON() as {
+    metadata?: {
+      kind?: string;
+      imageModel?: string;
+    };
+  };
+  expect(body.metadata?.kind).toBe('image');
+  expect(body.metadata?.imageModel).toBe('gpt-image-2');
+
+  const response = await createProjectResponse;
+  expect(response.ok(), `${response.status()} ${await response.text()}`).toBeTruthy();
+
+  await expectWorkspaceReady(page);
+  const { projectId } = await getCurrentProjectContext(page);
+  await expectScenarioProjectState(page, entry, projectId);
+}
+
+async function runVideoProjectRoutingFlow(
+  page: Page,
+  entry: UiScenario,
+) {
+  await createProjectNameOnly(page, entry);
+
+  const createProjectRequest = page.waitForRequest(isCreateProjectRequest);
+  const createProjectResponse = page.waitForResponse(isCreateProjectResponse);
+  await page.getByTestId('create-project').click();
+
+  const request = await createProjectRequest;
+  const body = request.postDataJSON() as {
+    metadata?: {
+      kind?: string;
+      videoModel?: string;
+      videoAspect?: string;
+      videoLength?: number;
+    };
+  };
+  expect(body.metadata?.kind).toBe('video');
+  expect(body.metadata?.videoModel).toBe('doubao-seedance-2-0-260128');
+  expect(body.metadata?.videoAspect).toBe('16:9');
+  expect(body.metadata?.videoLength).toBe(5);
+
+  const response = await createProjectResponse;
+  expect(response.ok()).toBeTruthy();
+
+  await expectWorkspaceReady(page);
+  const { projectId } = await getCurrentProjectContext(page);
+  await expectScenarioProjectState(page, entry, projectId);
+}
+
+async function runAudioProjectRoutingFlow(
+  page: Page,
+  entry: UiScenario,
+) {
+  await createProjectNameOnly(page, entry);
+
+  const createProjectRequest = page.waitForRequest(isCreateProjectRequest);
+  const createProjectResponse = page.waitForResponse(isCreateProjectResponse);
+  await page.getByTestId('create-project').click();
+
+  const request = await createProjectRequest;
+  const body = request.postDataJSON() as {
+    metadata?: {
+      kind?: string;
+      audioKind?: string;
+      audioModel?: string;
+      audioDuration?: number;
+    };
+  };
+  expect(body.metadata?.kind).toBe('audio');
+  expect(body.metadata?.audioKind).toBe('sfx');
+  expect(body.metadata?.audioModel).toBe('elevenlabs-sfx');
+  expect(typeof body.metadata?.audioDuration).toBe('number');
+  expect((body.metadata?.audioDuration ?? 0)).toBeGreaterThan(0);
+
+  const response = await createProjectResponse;
+  expect(response.ok()).toBeTruthy();
+
+  await expectWorkspaceReady(page);
+  const { projectId } = await getCurrentProjectContext(page);
+  const project = await fetchProjectFromApi(page, projectId);
+  await expectScenarioProjectState(page, entry, projectId);
+  const metadata = project.metadata as Record<string, unknown> | undefined;
+  expect(metadata?.audioDuration).toBe(body.metadata?.audioDuration);
+}
+
+async function runLiveArtifactProjectRoutingFlow(
+  page: Page,
+  entry: UiScenario,
+) {
+  await createProjectNameOnly(page, entry);
+
+  const createProjectRequest = page.waitForRequest(isCreateProjectRequest);
+  const createProjectResponse = page.waitForResponse(isCreateProjectResponse);
+  await page.getByTestId('create-project').click();
+
+  const request = await createProjectRequest;
+  const body = request.postDataJSON() as {
+    metadata?: {
+      kind?: string;
+      intent?: string;
+      fidelity?: string;
+    };
+  };
+  expect(body.metadata?.kind).toBe('prototype');
+  expect(body.metadata?.intent).toBe('live-artifact');
+  expect(body.metadata?.fidelity).toBe('high-fidelity');
+
+  const response = await createProjectResponse;
+  expect(response.ok()).toBeTruthy();
+
+  await expectWorkspaceReady(page);
+  const { projectId } = await getCurrentProjectContext(page);
+  await expectScenarioProjectState(page, entry, projectId);
+}
+
 
 async function runQuestionFormSelectionLimitFlow(
   page: Page,
@@ -559,7 +805,10 @@ async function runQuestionFormSubmitPersistenceFlow(
   page: Page,
   entry: UiScenario,
 ) {
+  const firstRunRequestPromise = page.waitForRequest(isCreateRunRequest);
   await sendPrompt(page, entry.prompt);
+  const firstRunBody = (await firstRunRequestPromise).postDataJSON() as Record<string, unknown>;
+  expectScenarioRunRequest(firstRunBody, entry);
 
   const form = page.locator('.question-form').first();
   await expect(form).toBeVisible();
@@ -609,7 +858,8 @@ async function runGenerationDoesNotCreateExtraFileFlow(
 
   const reloadedFiles = await listProjectFilesFromApi(page, projectId);
   expect(reloadedFiles.map((file) => file.name)).toEqual(initialFiles.map((file) => file.name));
-  await expect(page.getByText(entry.mockArtifact!.fileName, { exact: true })).toBeVisible();
+  await expect(page.getByText(entry.mockArtifact!.fileName, { exact: true }).first()).toBeVisible();
+  await expectScenarioProjectState(page, entry, projectId);
 }
 
 async function runCommentAttachmentFlow(
@@ -625,13 +875,13 @@ async function runCommentAttachmentFlow(
   await frame.locator('[data-od-id="hero-title"]').click();
   await expect(page.getByTestId('comment-popover')).toBeVisible();
   await page.getByTestId('comment-popover-input').fill('Make the headline more specific.');
-  await page.getByTestId('comment-popover').getByRole('button', { name: 'Save comment' }).click();
+  await page.getByTestId('comment-popover-save').click();
 
   await expect(page.getByTestId('comment-saved-marker-hero-title')).toBeVisible();
   await expect(page.getByTestId('staged-comment-attachments')).toHaveCount(0);
   await expect(page.getByTestId('chat-composer-input')).toHaveValue('');
   await expect(page.getByTestId('chat-send')).toBeDisabled();
-  await page.getByTestId('comment-popover').getByRole('button', { name: 'Close' }).click();
+  await expect(page.getByTestId('comment-popover')).toHaveCount(0);
 
   await frame.locator('[data-od-id="hero-copy"]').hover();
   await expect(page.getByTestId('comment-target-overlay')).toBeVisible();
@@ -640,50 +890,27 @@ async function runCommentAttachmentFlow(
   await page.getByTestId('comment-saved-marker-hero-title').getByRole('button').click();
   await expect(page.getByTestId('comment-popover')).toBeVisible();
   await expect(page.getByTestId('comment-popover-input')).toHaveValue('Make the headline more specific.');
-  await page.getByTestId('comment-popover').getByRole('button', { name: 'Close' }).click();
+  await page.locator('.comment-popover-close').click();
 
-  await page.getByRole('tab', { name: 'Comments' }).click();
-  await expect(page.getByTestId('comments-panel')).toBeVisible();
-  await expect(page.getByTestId('comments-panel').getByRole('heading', { name: 'Saved comments' })).toBeVisible();
-  await page.getByTestId('comments-panel')
-    .locator('[data-testid="comment-card-hero-title"]')
-    .getByRole('button', { name: 'Add' })
+  const sidePanel = page.getByTestId('comment-side-panel');
+  await expect(sidePanel).toBeVisible();
+  await expect(sidePanel).toContainText('Make the headline more specific.');
+  await sidePanel.getByTestId('comment-side-item').filter({ hasText: 'Make the headline more specific.' })
+    .getByRole('button', { name: 'Select' })
     .click();
-  await page.getByRole('tab', { name: 'Chat' }).click();
-  await expect(page.getByTestId('staged-comment-attachments')).toBeVisible();
-  await expect(page.getByTestId('staged-comment-attachments')).toContainText('hero-title');
-  await expect(page.getByTestId('staged-comment-attachments')).toContainText('Make the headline more specific.');
-
-  await page.getByRole('tab', { name: 'Comments' }).click();
-  await expect(page.getByTestId('comments-panel').getByRole('heading', { name: 'Attached to chat' })).toBeVisible();
-  await page.getByTestId('comments-panel')
-    .locator('[data-testid="comment-card-hero-title"]')
-    .getByRole('button', { name: 'Remove' })
-    .click();
-  await page.getByRole('tab', { name: 'Chat' }).click();
-  await expect(page.getByTestId('staged-comment-attachments')).toHaveCount(0);
-  await expect(page.getByTestId('chat-send')).toBeDisabled();
-
-  await page.getByRole('tab', { name: 'Comments' }).click();
-  await page.getByTestId('comments-panel')
-    .locator('[data-testid="comment-card-hero-title"]')
-    .getByRole('button', { name: 'Add' })
-    .click();
-  await page.getByRole('tab', { name: 'Chat' }).click();
-  await expect(page.getByTestId('staged-comment-attachments')).toContainText('hero-title');
+  await expect(page.getByTestId('comment-side-send-claude')).toBeVisible();
 
   const runRequest = page.waitForRequest(
     isCreateRunRequest,
   );
-  await page.getByTestId('chat-send').click();
+  await page.getByTestId('comment-side-send-claude').click();
   const request = await runRequest;
   const body = request.postDataJSON() as {
     message?: string;
     commentAttachments?: Array<{ elementId?: string; comment?: string; filePath?: string }>;
   };
 
-  expect(body.message).toMatch(/\n\n## user\n$/);
-  expect(body.message).not.toContain('Apply selected preview comments');
+  expect(body.message ?? '').not.toContain('Apply selected preview comments');
   expect(body.commentAttachments).toEqual([
     expect.objectContaining({
       elementId: 'hero-title',
@@ -783,11 +1010,44 @@ async function createProjectNameOnly(
   page: Page,
   entry: UiScenario,
 ) {
+  await openNewProjectModal(page);
   await expect(page.getByTestId('new-project-panel')).toBeVisible();
   if (entry.create.tab) {
     await page.getByTestId(`new-project-tab-${entry.create.tab}`).click();
   }
+  if (entry.create.tab === 'media' && entry.create.mediaSurface) {
+    await page.getByTestId(`new-project-media-surface-${entry.create.mediaSurface}`).click();
+  }
+  if (entry.create.tab === 'media' && entry.create.mediaSurface === 'video' && entry.create.videoModel) {
+    await page.getByTestId('model-picker-trigger').click();
+    await page.getByTestId(`model-picker-option-${entry.create.videoModel}`).click();
+  }
+  if (entry.create.tab === 'media' && entry.create.mediaSurface === 'audio' && entry.create.audioKind === 'sfx') {
+    await page.getByRole('button', { name: 'SFX' }).click();
+  }
   await page.getByTestId('new-project-name').fill(entry.create.projectName);
+}
+
+async function gotoEntryHome(page: Page) {
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await waitForLoadingToClear(page);
+  const privacyDialog = page.getByRole('dialog').filter({ hasText: 'Help us improve Open Design' });
+  if (await privacyDialog.isVisible()) {
+    await privacyDialog.getByRole('button', { name: /not now/i }).click();
+    await expect(privacyDialog).toHaveCount(0);
+  }
+  await expect(page.getByTestId('home-hero')).toBeVisible();
+  await expect(page.getByTestId('home-hero-input')).toBeVisible();
+}
+
+async function openNewProjectModal(page: Page) {
+  await page.getByTestId('entry-nav-new-project').click();
+  await expect(page.getByTestId('new-project-modal')).toBeVisible();
+  await expect(page.getByTestId('new-project-panel')).toBeVisible();
+}
+
+async function waitForLoadingToClear(page: Page) {
+  await page.getByText('Loading Open Design…').waitFor({ state: 'hidden', timeout: T.medium });
 }
 
 async function getCurrentProjectContext(
@@ -812,6 +1072,24 @@ async function getCurrentProjectContext(
   return { projectId, conversationId: active.id };
 }
 
+async function fetchProjectFromApi(
+  page: Page,
+  projectId: string,
+): Promise<{
+  metadata?: { kind?: string };
+  appliedPluginSnapshotId?: string;
+}> {
+  const response = await page.request.get(`/api/projects/${projectId}`);
+  expect(response.ok()).toBeTruthy();
+  const { project } = (await response.json()) as {
+    project: {
+      metadata?: { kind?: string };
+      appliedPluginSnapshotId?: string;
+    };
+  };
+  return project;
+}
+
 async function listProjectFilesFromApi(
   page: Page,
   projectId: string,
@@ -822,13 +1100,122 @@ async function listProjectFilesFromApi(
   return files;
 }
 
+async function expectScenarioProjectState(
+  page: Page,
+  entry: UiScenario,
+  projectId: string,
+) {
+  await expectScenarioProjectMetadata(page, entry, projectId);
+  await expectScenarioFiles(page, entry, projectId);
+  await expectScenarioPreviewText(page, entry);
+}
+
+async function expectScenarioProjectMetadata(
+  page: Page,
+  entry: UiScenario,
+  projectId: string,
+) {
+  if (!entry.expectedProjectMetadata) return;
+  const project = await fetchProjectFromApi(page, projectId);
+  const metadata = project.metadata as Record<string, unknown> | undefined;
+  expect(metadata).toBeDefined();
+  expectObjectContaining(metadata ?? {}, entry.expectedProjectMetadata);
+}
+
+async function expectScenarioFiles(
+  page: Page,
+  entry: UiScenario,
+  projectId: string,
+) {
+  if (!entry.expectedFiles?.length) return;
+  const files = await listProjectFilesFromApi(page, projectId);
+  for (const expectedFile of entry.expectedFiles) {
+    const actual = files.find((file) => file.name === expectedFile.name);
+    expect(actual, `missing expected file ${expectedFile.name}`).toBeDefined();
+    if (expectedFile.kind) {
+      expect(actual?.kind).toBe(expectedFile.kind);
+    }
+    if (expectedFile.previewText) {
+      await expectProjectFileToContain(page, projectId, expectedFile.name, expectedFile.previewText);
+    }
+  }
+}
+
+async function expectScenarioPreviewText(
+  page: Page,
+  entry: UiScenario,
+) {
+  if (!entry.expectedPreviewText) return;
+  const frame = page.frameLocator('[data-testid="artifact-preview-frame"]');
+  await expect(frame.getByText(entry.expectedPreviewText, { exact: false })).toBeVisible();
+}
+
+function expectScenarioRunRequest(
+  requestBody: Record<string, unknown>,
+  entry: UiScenario,
+) {
+  if (!entry.expectedRunRequest) return;
+  const normalizedActual = {
+    ...requestBody,
+    attachments: Array.isArray(requestBody.attachments)
+      ? requestBody.attachments
+      : [],
+  };
+  expectObjectContaining(normalizedActual, entry.expectedRunRequest);
+}
+
+function expectObjectContaining(
+  actual: Record<string, unknown>,
+  expected: Record<string, unknown>,
+) {
+  for (const [key, value] of Object.entries(expected)) {
+    const actualValue = actual[key];
+    if (Array.isArray(value)) {
+      expect(actualValue).toEqual(expect.arrayContaining(value));
+      continue;
+    }
+    if (value && typeof value === 'object') {
+      expect(actualValue).toBeTruthy();
+      expectObjectContaining(actualValue as Record<string, unknown>, value as Record<string, unknown>);
+      continue;
+    }
+    if (typeof value === 'string' && typeof actualValue === 'string') {
+      expect(actualValue).toContain(value);
+      continue;
+    }
+    expect(actualValue).toBe(value);
+  }
+}
+
+async function expectProjectFileToContain(
+  page: Page,
+  projectId: string,
+  fileName: string,
+  expected: string,
+) {
+  await expect
+    .poll(async () => {
+      const response = await page.request.get(`/api/projects/${projectId}/files/${fileName}`);
+      if (!response.ok()) return '';
+      return response.text();
+    }, { timeout: 15_000 })
+    .toContain(expected);
+}
+
 async function expectArtifactVisible(
   page: Page,
   entry: UiScenario,
 ) {
   const artifact = entry.mockArtifact!;
-  await expect(page.getByText(artifact.fileName, { exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: new RegExp(`${artifact.fileName.replace('.', '\\.')}$`, 'i') })).toBeVisible();
   await expect(page.getByTestId('artifact-preview-frame')).toBeVisible();
+  if (entry.kind === 'deck') {
+    await expect(page.getByLabel('Previous slide')).toBeVisible();
+    await expect(page.getByLabel('Next slide')).toBeVisible();
+    const { projectId } = await getCurrentProjectContext(page);
+    await expectProjectFileToContain(page, projectId, artifact.fileName, artifact.heading);
+    return;
+  }
   const frame = page.frameLocator('[data-testid="artifact-preview-frame"]');
   await expect(frame.getByRole('heading', { name: artifact.heading })).toBeVisible();
 }
@@ -840,6 +1227,8 @@ async function runConversationPersistenceFlow(
   await sendPrompt(page, entry.prompt);
   await expect(page.getByText(entry.prompt, { exact: true })).toBeVisible();
   await expectArtifactVisible(page, entry);
+  const firstContext = await getCurrentProjectContext(page);
+  const firstConversationId = firstContext.conversationId;
 
   await page.getByTestId('new-conversation').click();
   await expect(page.getByTestId('chat-composer-input')).toBeVisible();
@@ -848,6 +1237,9 @@ async function runConversationPersistenceFlow(
   const nextPrompt = entry.secondaryPrompt!;
   await sendPrompt(page, nextPrompt);
   await expect(page.getByText(nextPrompt, { exact: true })).toBeVisible();
+  const secondContext = await getCurrentProjectContext(page);
+  const secondConversationId = secondContext.conversationId;
+  expect(secondConversationId).not.toBe(firstConversationId);
 
   await page.reload();
   await expect(page.getByTestId('chat-composer')).toBeVisible();
@@ -865,6 +1257,15 @@ async function runConversationPersistenceFlow(
     .click();
 
   await expect(page.getByText(entry.prompt, { exact: true })).toBeVisible();
+  await expect(page.getByText(nextPrompt, { exact: true })).toHaveCount(0);
+  const { projectId } = await getCurrentProjectContext(page);
+  const conversationsResponse = await page.request.get(`/api/projects/${projectId}/conversations`);
+  expect(conversationsResponse.ok()).toBeTruthy();
+  const { conversations } = (await conversationsResponse.json()) as { conversations: Array<{ id: string }> };
+  expect(conversations.map((conversation) => conversation.id)).toEqual(
+    expect.arrayContaining([firstConversationId, secondConversationId]),
+  );
+  await expectScenarioProjectState(page, entry, projectId);
 }
 
 async function runFileMentionFlow(
@@ -897,6 +1298,14 @@ async function runFileMentionFlow(
   await expect(page.getByTestId('staged-attachments')).toBeVisible();
   await expect(page.getByTestId('staged-attachments').getByText('reference.txt', { exact: true })).toBeVisible();
   await expect(page.getByTestId('chat-send')).toBeEnabled();
+
+  const runRequestPromise = page.waitForRequest(isCreateRunRequest);
+  await page.getByTestId('chat-send').click();
+  const runBody = (await runRequestPromise).postDataJSON() as Record<string, unknown>;
+  expectScenarioRunRequest(runBody, entry);
+  await expect(page.locator('.msg.user').filter({ hasText: 'Review @reference.txt' }).first()).toBeVisible();
+  await expect(page.locator('.user-attachments').getByText('reference.txt', { exact: true })).toBeVisible();
+  await expectScenarioProjectState(page, entry, projectId);
 }
 
 async function runDeepLinkPreviewFlow(
@@ -907,27 +1316,32 @@ async function runDeepLinkPreviewFlow(
   await expectArtifactVisible(page, entry);
 
   const fileName = entry.mockArtifact!.fileName;
-  await expect(page).toHaveURL(new RegExp(`/projects/[^/]+/files/${fileName.replace('.', '\\.')}$`));
+  await expect(page).toHaveURL(
+    new RegExp(`/projects/[^/]+(?:/conversations/[^/]+)?/files/${fileName.replace('.', '\\.')}$`),
+  );
 
   const current = new URL(page.url());
-  const [, projects, projectId] = current.pathname.split('/');
+  const [, projects, projectId, maybeConversations, conversationId] = current.pathname.split('/');
   if (projects !== 'projects' || !projectId) {
     throw new Error(`unexpected project route: ${current.pathname}`);
   }
-
-  await page.goto(`/projects/${projectId}`);
+  await page.goto(`/projects/${projectId}`, { waitUntil: 'domcontentloaded' });
+  await waitForLoadingToClear(page);
   await expect(page.getByTestId('file-workspace')).toBeVisible();
 
-  await page.goto(`/projects/${projectId}/files/${fileName}`);
+  await page.goto(`/projects/${projectId}/files/${fileName}`, { waitUntil: 'domcontentloaded' });
+  await waitForLoadingToClear(page);
   await expect(page.getByTestId('artifact-preview-frame')).toBeVisible();
   const frame = page.frameLocator('[data-testid="artifact-preview-frame"]');
   await expect(frame.getByRole('heading', { name: entry.mockArtifact!.heading })).toBeVisible();
+  await expectScenarioProjectState(page, entry, projectId);
 }
 
 async function runFileUploadSendFlow(
   page: Page,
   entry: UiScenario,
 ) {
+  const { projectId } = await getCurrentProjectContext(page);
   const uploadResponse = page.waitForResponse(
     (resp: Response) => resp.url().includes('/upload') && resp.request().method() === 'POST',
     { timeout: 5000 },
@@ -948,6 +1362,7 @@ async function runFileUploadSendFlow(
   await sendPrompt(page, entry.prompt);
   await expect(page.getByText(entry.prompt, { exact: true })).toBeVisible();
   await expect(page.locator('.user-attachments').getByText('reference.txt', { exact: true })).toBeVisible();
+  await expectScenarioProjectState(page, entry, projectId);
 }
 
 async function runConversationDeleteRecoveryFlow(

@@ -17,6 +17,12 @@ export class PackagedPathAccessError extends Error {
   }
 }
 
+export type PackagedSingleInstanceApp = {
+  on: (event: "second-instance", listener: () => void) => unknown;
+  quit: () => void;
+  requestSingleInstanceLock: () => boolean;
+};
+
 type PathDiagnostic = {
   exists: boolean;
   mode?: number;
@@ -104,6 +110,7 @@ export async function ensurePackagedNamespacePaths(
     mkdir(paths.logsRoot, { recursive: true }),
     mkdir(paths.desktopLogsRoot, { recursive: true }),
     mkdir(paths.runtimeRoot, { recursive: true }),
+    mkdir(paths.updateRoot, { recursive: true }),
     mkdir(paths.electronUserDataRoot, { recursive: true }),
     mkdir(paths.electronSessionDataRoot, { recursive: true }),
   ]);
@@ -115,4 +122,18 @@ export function applyPackagedElectronPathOverrides(
   app.setPath("userData", paths.electronUserDataRoot);
   app.setPath("sessionData", paths.electronSessionDataRoot);
   app.setPath("logs", paths.desktopLogsRoot);
+}
+
+export function claimPackagedSingleInstanceLock(
+  electronApp: PackagedSingleInstanceApp,
+  onSecondInstance: () => void,
+): boolean {
+  if (!electronApp.requestSingleInstanceLock()) {
+    electronApp.quit();
+    return false;
+  }
+  electronApp.on("second-instance", () => {
+    onSecondInstance();
+  });
+  return true;
 }
