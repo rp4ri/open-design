@@ -24,6 +24,7 @@ import {
   shouldRenderCodexImagegenOverride,
 } from './prompts/system.js';
 import { expandHomePrefix, resolveProjectRelativePath } from './home-expansion.js';
+import { userFacingAgentLabel } from './user-facing-agent-label.js';
 import { createCommandInvocation } from '@open-design/platform';
 import { SIDECAR_DEFAULTS, SIDECAR_ENV } from '@open-design/sidecar-proto';
 import {
@@ -91,13 +92,18 @@ import {
   applyPlugin,
   buildConnectorProbe,
   defaultBundledRoot,
+  detectSkillPluginCandidate,
+  dismissSkillPluginCandidate,
   doctorPlugin,
   FIRST_PARTY_ATOMS,
+  generateSkillPluginDraft,
   getInstalledPlugin,
   getSnapshot,
   installFromLocalFolder,
   installPlugin,
+  insertSkillPluginCandidate,
   isDiffReviewSurfaceId,
+  listSkillPluginCandidates,
   listInstalledPlugins,
   listIterationsForRun,
   MissingInputError,
@@ -1130,7 +1136,7 @@ export function resolveStaticSpaFallbackPath(req, staticDir) {
 }
 
 export function registerStaticSpaFallback(app, staticDir) {
-  app.get('*', (req, res, next) => {
+  app.get('/*splat', (req, res, next) => {
     const indexPath = resolveStaticSpaFallbackPath(req, staticDir);
     if (indexPath == null) return next();
     res.sendFile(indexPath);
@@ -2006,6 +2012,81 @@ function reconcileAssistantMessageOnRunEnd(db, runs, run) {
     .catch((err) => {
       console.warn('[runs] message reconciliation failed', err);
     });
+}
+
+function detectSkillPluginCandidateOnRunSuccess(db, runs, run, input, projectRoot) {
+  if (!run.projectId || !run.conversationId) return;
+  void runs
+    .wait(run)
+    .then(async (finalStatus) => {
+      if (finalStatus.status !== 'succeeded') return;
+      const detected = await detectSkillPluginCandidate({
+        projectId: run.projectId,
+        runId: run.id,
+        conversationId: run.conversationId,
+        assistantMessageId: null,
+        message: input?.message ?? input?.currentPrompt,
+        attachments: input?.attachments,
+        projectRoot,
+      });
+      const candidate = detected ? insertSkillPluginCandidate(db, detected) : null;
+      if (!candidate || candidate.status === 'dismissed') return;
+      upsertSkillPluginCandidateAssistantMessage(db, run, candidate);
+    })
+    .catch((err) => {
+      console.warn('[plugins] skill candidate detection failed', err);
+    });
+}
+
+export function upsertSkillPluginCandidateAssistantMessage(db, run, candidate) {
+  const currentMessagePosition = run.assistantMessageId
+    ? (db.prepare(`SELECT position FROM messages WHERE id = ?`).get(run.assistantMessageId)?.position ?? null)
+    : null;
+  const existingMessagePosition = candidate.assistantMessageId
+    ? (db.prepare(`SELECT position FROM messages WHERE id = ?`).get(candidate.assistantMessageId)?.position ?? null)
+    : null;
+  if (
+    typeof currentMessagePosition === 'number' &&
+    typeof existingMessagePosition === 'number' &&
+    existingMessagePosition > currentMessagePosition
+  ) {
+    return null;
+  }
+  const canReuseExistingMessage =
+    candidate.assistantMessageId &&
+    candidate.assistantMessageId !== run.assistantMessageId &&
+    typeof existingMessagePosition === 'number';
+  const messageId = canReuseExistingMessage ? candidate.assistantMessageId : randomUUID();
+  if (
+    candidate.assistantMessageId &&
+    candidate.assistantMessageId !== messageId &&
+    candidate.assistantMessageId !== run.assistantMessageId
+  ) {
+    db.prepare(`DELETE FROM messages WHERE id = ?`).run(candidate.assistantMessageId);
+  }
+  const now = Date.now();
+  upsertMessage(db, run.conversationId, {
+    id: messageId,
+    role: 'assistant',
+    content: `Open Design found reusable skill material that can become a plugin: ${candidate.title}`,
+    agentId: run.agentId ?? undefined,
+    events: [{
+      kind: 'plugin_candidate',
+      candidateId: candidate.id,
+      title: candidate.title,
+      description: candidate.description,
+      confidence: candidate.confidence,
+      draftPath: candidate.draftPath ?? null,
+    }],
+    createdAt: now,
+    endedAt: now,
+  });
+  db.prepare(
+    `UPDATE skill_plugin_candidates
+        SET assistant_message_id = ?, updated_at = ?
+      WHERE id = ?`,
+  ).run(messageId, now, candidate.id);
+  return messageId;
 }
 
 function persistRunEventToAssistantMessage(db, run, event, data) {
@@ -5722,7 +5803,8 @@ export async function startServer({
         res.setHeader('Access-Control-Allow-Origin', 'null');
       }
       res.setHeader('Cache-Control', 'no-store');
-      res.sendFile(sheet.absPath);
+      const buf = await fs.promises.readFile(sheet.absPath);
+      res.send(buf);
     } catch (err) {
       res.status(500).type('text/plain').send(String(err));
     }
@@ -6945,11 +7027,12 @@ export async function startServer({
     });
   });
 
-  app.get('/api/plugins/:id/asset/*', async (req, res) => {
+  app.get('/api/plugins/:id/asset/*splat', async (req, res) => {
     try {
       const plugin = getInstalledPlugin(db, req.params.id);
       if (!plugin) return res.status(404).json({ error: 'plugin not found' });
-      const relpath = String(req.params[0] ?? '');
+      const splatParam = req.params.splat;
+      const relpath = Array.isArray(splatParam) ? splatParam.join('/') : String(splatParam ?? '');
       // Reject obvious traversal up-front; the path resolution below
       // normalizes again, but this catches the easy cases without
       // touching disk.
@@ -6960,9 +7043,37 @@ export async function startServer({
       const fsp = await import('node:fs/promises');
       const resolved = path.resolve(plugin.fsPath, relpath);
       // Final containment check — `resolved` must stay under fsPath.
-      const root = path.resolve(plugin.fsPath) + path.sep;
-      if (!(resolved + path.sep).startsWith(root) && resolved !== path.resolve(plugin.fsPath)) {
+      const root = path.resolve(plugin.fsPath);
+      const rootWithSep = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+      if (!(resolved + path.sep).startsWith(rootWithSep) && resolved !== root) {
         return res.status(400).json({ error: 'asset escape rejected' });
+      }
+      const relativeSegments = path.relative(root, resolved).split(path.sep).filter(Boolean);
+      let current = root;
+      try {
+        const rootStat = await fsp.lstat(current);
+        if (rootStat.isSymbolicLink()) {
+          return res.status(404).json({ error: 'asset not found' });
+        }
+        for (const segment of relativeSegments) {
+          current = path.join(current, segment);
+          const stat = await fsp.lstat(current);
+          if (stat.isSymbolicLink()) {
+            return res.status(404).json({ error: 'asset not found' });
+          }
+        }
+      } catch {
+        return res.status(404).json({ error: 'asset not found' });
+      }
+      try {
+        const rootReal = await fsp.realpath(plugin.fsPath);
+        const resolvedReal = await fsp.realpath(resolved);
+        const rootRealWithSep = rootReal.endsWith(path.sep) ? rootReal : `${rootReal}${path.sep}`;
+        if (resolvedReal !== rootReal && !resolvedReal.startsWith(rootRealWithSep)) {
+          return res.status(400).json({ error: 'asset escape rejected' });
+        }
+      } catch {
+        return res.status(404).json({ error: 'asset not found' });
       }
       let buf;
       try {
@@ -7749,14 +7860,15 @@ export async function startServer({
   // The example response above rewrites `./assets/<file>` into a request
   // against this route; we still keep the on-disk paths human-friendly so
   // contributors can preview `example.html` straight from disk.
-  app.get('/api/skills/:id/assets/*', async (req, res) => {
+  app.get('/api/skills/:id/assets/*splat', async (req, res) => {
     try {
       const skills = await listAllSkills();
       const skill = findSkillById(skills, req.params.id);
       if (!skill) {
         return res.status(404).type('text/plain').send('skill not found');
       }
-      const relPath = String(req.params[0] || '');
+      const splatParam = req.params.splat;
+      const relPath = Array.isArray(splatParam) ? splatParam.join('/') : String(splatParam || '');
       const assetsRoot = path.resolve(skill.dir, 'assets');
       const target = path.resolve(assetsRoot, relPath);
       if (target !== assetsRoot && !target.startsWith(assetsRoot + path.sep)) {
@@ -7771,7 +7883,7 @@ export async function startServer({
       if (req.headers.origin === 'null') {
         res.header('Access-Control-Allow-Origin', '*');
       }
-      res.type(mimeFor(target)).sendFile(target);
+      await res.type(mimeFor(target)).sendFile(target);
     } catch (err) {
       res.status(500).type('text/plain').send(String(err));
     }
@@ -8579,6 +8691,120 @@ export async function startServer({
     }
   });
 
+  app.get('/api/projects/:id/plugin-candidates', (req, res) => {
+    try {
+      const project = getProject(db, req.params.id);
+      if (!project) {
+        sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        return;
+      }
+      const includeDismissed = req.query.includeDismissed === 'true';
+      res.json({ candidates: listSkillPluginCandidates(db, req.params.id, includeDismissed) });
+    } catch (err) {
+      res.status(400).json({ error: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/projects/:id/plugin-candidates/:candidateId/dismiss', (req, res) => {
+    if (!isLocalSameOrigin(req, resolvedPort)) {
+      return res.status(403).json({ error: 'cross-origin request rejected' });
+    }
+    const candidate = dismissSkillPluginCandidate(db, req.params.id, req.params.candidateId);
+    if (!candidate) {
+      sendApiError(res, 404, 'NOT_FOUND', 'plugin candidate not found');
+      return;
+    }
+    if (candidate.assistantMessageId) {
+      db.prepare(`DELETE FROM messages WHERE id = ?`).run(candidate.assistantMessageId);
+    }
+    res.json({ ok: true, candidate });
+  });
+
+  app.post('/api/projects/:id/plugin-candidates/:candidateId/draft', async (req, res) => {
+    if (!isLocalSameOrigin(req, resolvedPort)) {
+      return res.status(403).json({ error: 'cross-origin request rejected' });
+    }
+    try {
+      const project = getProject(db, req.params.id);
+      if (!project) {
+        sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        return;
+      }
+      const projectRoot = resolveProjectDir(PROJECTS_DIR, req.params.id, project.metadata);
+      const result = await generateSkillPluginDraft(db, projectRoot, req.params.id, req.params.candidateId);
+      if (!result) {
+        sendApiError(res, 404, 'NOT_FOUND', 'plugin candidate not found');
+        return;
+      }
+      res.status(result.ok ? 200 : 422).json(result);
+    } catch (err) {
+      res.status(400).json({ ok: false, message: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/projects/:id/plugin-candidates/:candidateId/share-tasks', async (req, res) => {
+    if (!isLocalSameOrigin(req, resolvedPort)) {
+      return res.status(403).json({ error: 'cross-origin request rejected' });
+    }
+    try {
+      const project = getProject(db, req.params.id);
+      if (!project) {
+        sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        return;
+      }
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const action = body.action === 'publish-github' || body.action === 'contribute-open-design'
+        ? body.action
+        : null;
+      if (!action) {
+        sendApiError(res, 400, 'BAD_REQUEST', 'plugin share action is required');
+        return;
+      }
+      const projectRoot = resolveProjectDir(PROJECTS_DIR, req.params.id, project.metadata);
+      const draft = await generateSkillPluginDraft(db, projectRoot, req.params.id, req.params.candidateId);
+      if (!draft) {
+        sendApiError(res, 404, 'NOT_FOUND', 'plugin candidate not found');
+        return;
+      }
+      if (!draft.validation.ok) {
+        res.status(422).json({
+          ok: false,
+          code: 'plugin-draft-invalid',
+          message: 'Generated plugin draft is invalid.',
+          draft,
+        });
+        return;
+      }
+      const taskId = randomUUID();
+      const task = createPluginShareTask(taskId, req.params.id, {
+        action,
+        path: draft.draftPath,
+      });
+      task.status = 'running';
+      notifyPluginShareTaskWaiters(task);
+      void runPluginShareTask(task, draft.folder).catch((err) => {
+        task.status = 'failed';
+        task.error = {
+          code: 'plugin-share-task-failed',
+          message: String(err?.message || err),
+          log: [String(err?.stack || err?.message || err)],
+        };
+        task.endedAt = Date.now();
+        notifyPluginShareTaskWaiters(task);
+      });
+      res.status(202).json({
+        taskId,
+        action,
+        path: draft.draftPath,
+        status: task.status,
+        startedAt: task.startedAt,
+        draft,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, message: String(err?.message || err) });
+    }
+  });
+
   app.post('/api/projects/:id/plugins/contribute-open-design', async (req, res) => {
     try {
       const project = getProject(db, req.params.id);
@@ -8813,7 +9039,7 @@ export async function startServer({
   // Preflight for the raw file route. Current artifact fetches are simple GETs
   // (no preflight needed), but an explicit handler future-proofs the route if
   // artifacts ever add custom request headers.
-  app.options('/api/projects/:id/raw/*', (req, res) => {
+  app.options(/^\/api\/projects\/([^/]+)\/raw\/(.+)$/u, (req, res) => {
     if (req.headers.origin === 'null') {
       res.header('Access-Control-Allow-Origin', '*');
       res.header('Access-Control-Allow-Methods', 'GET');
@@ -8822,11 +9048,12 @@ export async function startServer({
     res.sendStatus(204);
   });
 
-  app.get('/api/projects/:id/raw/*', async (req, res) => {
+  app.get(/^\/api\/projects\/([^/]+)\/raw\/(.+)$/u, async (req, res) => {
     try {
-      const relPath = req.params[0];
-      const project = getProject(db, req.params.id);
-      const file = await readProjectFile(PROJECTS_DIR, req.params.id, relPath, project?.metadata);
+      const projectId = String(req.params[0] ?? '');
+      const relPath = String(req.params[1] ?? '');
+      const project = getProject(db, projectId);
+      const file = await readProjectFile(PROJECTS_DIR, projectId, relPath, project?.metadata);
       // PreviewModal loads artifact HTML via srcdoc, giving the iframe Origin: "null".
       // data: URIs, file://, and some sandboxed iframes also send null — all are
       // local-only callers, so this is safe. Real cross-origin sites send a real
@@ -8881,10 +9108,12 @@ export async function startServer({
     }
   });
 
-  app.delete('/api/projects/:id/raw/*', async (req, res) => {
+  app.delete(/^\/api\/projects\/([^/]+)\/raw\/(.+)$/u, async (req, res) => {
     try {
-      const project = getProject(db, req.params.id);
-      await deleteProjectFile(PROJECTS_DIR, req.params.id, req.params[0], project?.metadata);
+      const projectId = String(req.params[0] ?? '');
+      const rawSplat = String(req.params[1] ?? '');
+      const project = getProject(db, projectId);
+      await deleteProjectFile(PROJECTS_DIR, projectId, rawSplat, project?.metadata);
       /** @type {import('@open-design/contracts').DeleteProjectFileResponse} */
       const body = { ok: true };
       res.json(body);
@@ -8926,13 +9155,15 @@ export async function startServer({
     }
   });
 
-  app.get('/api/projects/:id/files/*', async (req, res) => {
+  app.get(/^\/api\/projects\/([^/]+)\/files\/(.+)$/u, async (req, res) => {
     try {
-      const project = getProject(db, req.params.id);
+      const projectId = String(req.params[0] ?? '');
+      const fileSplat = String(req.params[1] ?? '');
+      const project = getProject(db, projectId);
       const file = await readProjectFile(
         PROJECTS_DIR,
-        req.params.id,
-        req.params[0],
+        projectId,
+        fileSplat,
         project?.metadata,
       );
       res.type(file.mime).send(file.buffer);
@@ -10660,7 +10891,7 @@ export async function startServer({
       const message =
         `Agent stalled without emitting any new output for ${Math.round(inactivityTimeoutMs / 1000)}s. ` +
         'The model or CLI likely hung while generating. ' +
-        `Phase details: spawned agent binary ${resolvedBin}; stdout arrived: ${childStdoutSeen ? 'yes' : 'no'}; ` +
+        `Phase details: spawned agent ${userFacingAgentLabel(agentId, resolvedBin)}; stdout arrived: ${childStdoutSeen ? 'yes' : 'no'}; ` +
         `last agent event: ${lastAgentEventPhase}; largest tool result observed: ${lastToolResultChars} chars. ` +
         'Retry the turn, pick a different model, or start a new conversation if the prior context is very large.';
       send('error', createSseErrorPayload('AGENT_EXECUTION_FAILED', message, { retryable: true }));
@@ -10752,7 +10983,7 @@ export async function startServer({
     send('start', {
       runId,
       agentId,
-      bin: resolvedBin,
+      bin: userFacingAgentLabel(agentId, resolvedBin),
       streamFormat: def.streamFormat ?? 'plain',
       projectId: typeof projectId === 'string' ? projectId : null,
       cwd,
@@ -11740,6 +11971,15 @@ export async function startServer({
       });
     }
     reconcileAssistantMessageOnRunEnd(db, design.runs, run);
+    if (run.projectId && run.conversationId) {
+      try {
+        const project = getProject(db, run.projectId);
+        const projectRoot = resolveProjectDir(PROJECTS_DIR, run.projectId, project?.metadata);
+        detectSkillPluginCandidateOnRunSuccess(db, design.runs, run, req.body || {}, projectRoot);
+      } catch (err) {
+        console.warn('[plugins] skill candidate hook setup failed', err);
+      }
+    }
     design.runs.start(run, () => startChatRun(meta, run));
 
     // Analytics v2: emit run_created (daemon-side authoritative) and
@@ -12403,6 +12643,32 @@ export async function startServer({
     let server;
     try {
       server = app.listen(port, host, () => {
+        // Widen the between-request idle window so kept-alive sockets
+        // belonging to chat/SSE clients survive the gaps between bursts.
+        //
+        // Node's `keepAliveTimeout` (default 5s) only arms *after* a
+        // response finishes writing, bounding the idle gap before the next
+        // request on the same socket — it does not fire while an SSE
+        // response is still streaming. A streaming `/api/runs/:id/events`
+        // response stays open until the agent finishes, so middlebox idle
+        // timers (nginx, socat/docker bridges, EC2 SG NAT) are typically
+        // the proximate cause when an SSE stream drops; this listener-
+        // side change cannot extend a connection past those middleboxes.
+        //
+        // What it *does* fix: chat clients that pipeline multiple requests
+        // on the same TCP socket (status polls, run-status fetches, the
+        // initial GET before the SSE upgrade). With the default 5s window
+        // a sluggish client can lose the connection between two normal
+        // calls and reconnect-storm. 120s aligns with the in-band
+        // SSE_KEEPALIVE_INTERVAL_MS (25s) so kept-alive sockets used
+        // around an SSE stream stay warm across reasonable client pauses.
+        //
+        // `headersTimeout` must exceed `keepAliveTimeout` per the Node
+        // docs; otherwise a slow-loris client can stall request parsing.
+        if (server) {
+          server.keepAliveTimeout = 120_000;
+          server.headersTimeout = 125_000;
+        }
         const address = server.address();
         // `address()` can in theory return `string | AddressInfo | null`. For
         // a TCP listener it's always `AddressInfo` with a `.port` — the guard
