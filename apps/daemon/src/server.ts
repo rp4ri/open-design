@@ -55,6 +55,7 @@ import {
   cancelVelaLogin,
   forgetVelaLogin,
   mergeVelaEnv,
+  readVelaCredentialRevision,
   readVelaLoginStatus,
   spawnVelaLogin,
 } from './integrations/vela.js';
@@ -62,6 +63,11 @@ import {
   amrAccountFailureDetails,
   classifyAmrAccountFailure,
 } from './integrations/vela-errors.js';
+import { amrModelLoadingCache } from './runtimes/amr-model-cache.js';
+import {
+  fetchVelaPresetModels,
+  fetchVelaRemoteModelsWithRetry,
+} from './runtimes/defs/amr.js';
 import { migrateLegacyDataDirSync } from './legacy-data-migrator.js';
 import {
   consumedImportNonces,
@@ -93,7 +99,7 @@ import { installFromTarget, uninstallById, sanitizeRepoName } from './library-in
 import { buildWindowsFolderDialogCommand, parseFolderDialogStdout } from './native-folder-dialog.js';
 import { listCodexPets, readCodexPetSpritesheet } from './codex-pets.js';
 import { syncCommunityPets } from './community-pets-sync.js';
-import { parseMediaExecutionPolicyInput } from './media-policy.js';
+import { defaultMediaExecutionPolicy, parseMediaExecutionPolicyInput } from './media-policy.js';
 import {
   applySandboxRuntimeEnv,
   ensureSandboxRuntimeDirs,
@@ -238,6 +244,13 @@ import { renderDesignSystemPreview } from './design-system-preview.js';
 import { renderDesignSystemShowcase } from './design-system-showcase.js';
 import { createChatRunService } from './runs.js';
 import { deriveRunErrorCode, runResultFromStatus } from './run-result.js';
+import { classifyRunFailure } from './run-failure-classification.js';
+import {
+  hasExplicitRequestedModelForAnalytics,
+  scanRunEventsForUsageAnalytics,
+  summarizeRunTimingAnalytics,
+} from './run-analytics-observability.js';
+import { summarizeRunDiagnosticsForAnalytics } from './run-diagnostics.js';
 import {
   countDesignSystemPreviewModules,
   countNewHtmlArtifacts,
@@ -248,6 +261,11 @@ import {
   reportRunCompletedFromDaemon,
   reportRunFeedbackFromDaemon,
 } from './langfuse-bridge.js';
+import {
+  deriveLangfuseDeliveryState,
+  readTelemetrySinkConfig,
+} from './langfuse-trace.js';
+import { buildPromptStackTelemetry } from './prompt-telemetry.js';
 import {
   createAnalyticsService,
   newInsertId,
@@ -2016,39 +2034,12 @@ export function __forTestResolveRunProjectKindForAnalytics(args) {
 // usage tokens are found AND (the caller already has a model from reqBody
 // OR the agent-reported model has been found).
 function scanRunEventsForFinishedProps(events, reqBodyModel) {
-  let inputTokens;
-  let outputTokens;
-  let agentReportedModel = null;
-  const needAgentModel = !(typeof reqBodyModel === 'string' && reqBodyModel.trim());
-  let haveUsageTokens = false;
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const ev = events[i];
-    const data = ev?.data;
-    if (ev?.event === 'agent' && data?.type === 'usage' && data.usage && !haveUsageTokens) {
-      const u = data.usage;
-      if (typeof u.input_tokens === 'number') inputTokens = u.input_tokens;
-      if (typeof u.output_tokens === 'number') outputTokens = u.output_tokens;
-      if (inputTokens !== undefined || outputTokens !== undefined) haveUsageTokens = true;
-    }
-    if (
-      !agentReportedModel &&
-      ev?.event === 'agent' &&
-      data?.type === 'status' &&
-      (data.label === 'model' || data.label === 'initializing')
-    ) {
-      const candidate =
-        typeof data.model === 'string'
-          ? data.model
-          : typeof data.detail === 'string'
-            ? data.detail
-            : null;
-      if (candidate && candidate.trim()) {
-        agentReportedModel = candidate.trim();
-      }
-    }
-    if (haveUsageTokens && (!needAgentModel || agentReportedModel)) break;
-  }
-  return { inputTokens, outputTokens, agentReportedModel };
+  const usage = scanRunEventsForUsageAnalytics(events, reqBodyModel, 0);
+  return {
+    inputTokens: usage.input_tokens,
+    outputTokens: usage.output_tokens,
+    agentReportedModel: usage.agent_reported_model,
+  };
 }
 
 export function __forTestScanRunEventsForFinishedProps(events, reqBodyModel) {
@@ -3209,8 +3200,8 @@ function authorizeToolRequest(req, res, operation) {
   return validation.grant;
 }
 
-function optionalToolGrantFromRequest(req) {
-  const validation = toolTokenRegistry.validate(bearerTokenFromRequest(req));
+function optionalToolGrantFromRequest(req, options = {}) {
+  const validation = toolTokenRegistry.validate(bearerTokenFromRequest(req), options);
   return validation.ok ? validation.grant : null;
 }
 
@@ -4521,8 +4512,8 @@ export async function startServer({
     res.json({
       ok: true,
       version: versionInfo.version,
-      bindHost: process.env.OD_BIND_HOST ?? '127.0.0.1',
-      port: Number(process.env.OD_PORT ?? 7456),
+      bindHost: host,
+      port: resolvedPort,
       dataDir: RUNTIME_DATA_DIR,
       mediaConfigDir: process.env.OD_MEDIA_CONFIG_DIR ?? null,
       sandboxMode: SANDBOX_RUNTIME.enabled,
@@ -4787,7 +4778,11 @@ export async function startServer({
   app.get(
     DIAGNOSTICS_EXPORT_PATH,
     requireLocalDaemonRequest,
-    createDiagnosticsExportHandler({ runtime, projectRoot: PROJECT_ROOT }),
+    createDiagnosticsExportHandler({
+      runtime,
+      projectRoot: PROJECT_ROOT,
+      runsDir: path.join(RUNTIME_DATA_DIR, 'runs'),
+    }),
   );
 
   // ---- Projects (DB-backed) -------------------------------------------------
@@ -6044,6 +6039,7 @@ export async function startServer({
     });
     // Bump the parent project's updatedAt so the project list re-orders.
     updateProject(db, req.params.id, {});
+    reportFinalizedMessage(saved, m);
     res.json({ message: saved });
   });
 
@@ -6224,11 +6220,68 @@ export async function startServer({
   // The vela CLI owns the device-authorization UX (URL + code + browser open);
   // these routes only surface enough state for Open Design's Settings card to
   // show login status and trigger a login from a button.
+  async function resolveAmrModelProbe() {
+    const appConfig = await readAppConfig(RUNTIME_DATA_DIR);
+    const configuredEnv = agentCliEnvForAgent(appConfig.agentCliEnv, 'amr');
+    const def = getAgentDef('amr');
+    if (!def) throw new Error('AMR runtime definition is missing');
+    const agentLaunch = resolveAgentLaunch(def, configuredEnv);
+    const launchPath = agentLaunch.launchPath ?? agentLaunch.selectedPath;
+    if (!launchPath) throw new Error('AMR vela binary could not be resolved');
+    const env = applyAgentLaunchEnv(
+      spawnEnvForAgent(
+        def.id,
+        {
+          ...process.env,
+          ...(def.env || {}),
+        },
+        configuredEnv,
+        undefined,
+      ),
+      agentLaunch,
+    );
+    const credentialRevision = readVelaCredentialRevision(process.env, configuredEnv);
+    const cacheKey = JSON.stringify({
+      launchPath,
+      home: env.HOME ?? env.USERPROFILE ?? '',
+      openDesignAmrProfile: env.OPEN_DESIGN_AMR_PROFILE ?? '',
+      velaProfile: env.VELA_PROFILE ?? '',
+      velaLinkUrl: env.VELA_LINK_URL ?? '',
+      velaRuntimeKey: env.VELA_RUNTIME_KEY ?? '',
+      velaOpencodeBin: env.VELA_OPENCODE_BIN ?? '',
+      credentialRevision,
+    });
+    return { launchPath, env, configuredEnv, cacheKey };
+  }
+
+  app.get('/api/amr/models', async (_req, res) => {
+    try {
+      const probe = await resolveAmrModelProbe();
+      const response = await amrModelLoadingCache.get(probe.cacheKey, {
+        fetchPreset: () => fetchVelaPresetModels(probe.launchPath, probe.env),
+        fetchRemote: () => fetchVelaRemoteModelsWithRetry(probe.launchPath, probe.env),
+      });
+      res.json(response);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/integrations/vela/status', async (_req, res) => {
     try {
       const appConfig = await readAppConfig(RUNTIME_DATA_DIR);
       const configuredEnv = agentCliEnvForAgent(appConfig.agentCliEnv, 'amr');
-      res.json(readVelaLoginStatus(mergeVelaEnv(process.env, configuredEnv)));
+      const status = readVelaLoginStatus(mergeVelaEnv(process.env, configuredEnv));
+      if (status.loggedIn) {
+        void resolveAmrModelProbe()
+          .then((probe) => {
+            amrModelLoadingCache.warm(probe.cacheKey, () =>
+              fetchVelaRemoteModelsWithRetry(probe.launchPath, probe.env),
+            );
+          })
+          .catch((err) => console.warn('[amr] model cache warm failed', err));
+      }
+      res.json(status);
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -10566,7 +10619,19 @@ export async function startServer({
     // `listSkills()` scan in `startChatRun`. critiqueShouldRun threads
     // the same panel-eligibility decision down to the spawn-path
     // orchestrator gate so prompt and orchestrator stay in lockstep.
-    return { prompt, activeSkillDir, activeSkillDirs, critiqueShouldRun };
+    return {
+      prompt,
+      activeSkillDir,
+      activeSkillDirs,
+      critiqueShouldRun,
+      promptTelemetryParts: {
+        skillPrompt: skillBody ?? '',
+        designSystemPrompt: designSystemBody ?? '',
+        pluginStagePrompt: [pluginBlock, ...(activeStageBlocks ?? [])]
+          .filter((part) => typeof part === 'string' && part.trim().length > 0)
+          .join('\n\n---\n\n'),
+      },
+    };
   };
 
   // Plan §3.I1 / §3.D / spec §10.1: fire the pipeline schedule on a
@@ -10643,6 +10708,10 @@ export async function startServer({
   };
 
   const startChatRun = async (chatBody, run) => {
+    run.analyticsTelemetry = {
+      ...(run.analyticsTelemetry ?? {}),
+      startChatRunStartedAt: Date.now(),
+    };
     /** @type {Partial<ChatRequest> & { imagePaths?: string[] }} */
     chatBody = chatBody || {};
     const {
@@ -10924,6 +10993,7 @@ export async function startServer({
       prompt: daemonSystemPrompt,
       activeSkillDirs,
       critiqueShouldRun,
+      promptTelemetryParts,
     } =
       await composeDaemonSystemPrompt({
         agentId,
@@ -11080,6 +11150,52 @@ export async function startServer({
         ? `\n\n${promptImagePaths.map((p) => `@${p}`).join(' ')}`
         : '',
     ].join('');
+    run.promptTelemetry = buildPromptStackTelemetry({
+      composedPrompt: composed,
+      sections: [
+        { kind: 'formOverride', content: formOverride },
+        // Phase 1 explicitly needs redactedContent for these aggregate prompts:
+        // they are the quickest way to inspect the system context sent to the
+        // model when diagnosing Langfuse traces.
+        { kind: 'daemonSystemPrompt', content: daemonSystemPrompt },
+        { kind: 'runtimeToolPrompt', content: runtimeToolPrompt },
+        { kind: 'researchCommandContract', content: researchCommandContract },
+        { kind: 'runContextPrompt', content: runContextPrompt },
+        { kind: 'clientSystemPrompt', content: clientInstructionPrompt },
+        { kind: 'echoGuard', content: ECHO_GUARD },
+        { kind: 'userRequest', content: userRequestPrompt },
+        { kind: 'skillPrompt', content: promptTelemetryParts?.skillPrompt },
+        {
+          kind: 'designSystemPrompt',
+          content: promptTelemetryParts?.designSystemPrompt,
+        },
+        {
+          kind: 'pluginStagePrompt',
+          content: promptTelemetryParts?.pluginStagePrompt,
+        },
+        { kind: 'cwdHint', content: cwdHint, metadata: cwd ? [cwd] : [] },
+        {
+          kind: 'linkedDirsHint',
+          content: linkedDirsHint,
+          metadata: linkedDirs,
+        },
+        {
+          kind: 'attachments',
+          content: attachmentHint,
+          metadata: safeAttachments,
+        },
+        {
+          kind: 'commentAttachments',
+          content: commentHint,
+          metadata: safeCommentAttachments,
+        },
+        {
+          kind: 'promptImagePaths',
+          content: promptImagePaths.join('\n'),
+          metadata: promptImagePaths,
+        },
+      ],
+    });
     // Per-agent model + reasoning the user picked in the model menu.
     // Trust the value when it matches the most recent /api/agents listing
     // (live or fallback). Otherwise allow it through if it passes a
@@ -11526,7 +11642,11 @@ export async function startServer({
         return `tool_use:${name}`;
       }
       if (type === 'text_delta' || type === 'thinking_delta') {
-        const text = typeof payload.text === 'string' ? payload.text : '';
+        const text = typeof payload.delta === 'string'
+          ? payload.delta
+          : typeof payload.text === 'string'
+            ? payload.text
+            : '';
         return `${type}:${text.length} chars`;
       }
       return type;
@@ -11759,6 +11879,10 @@ export async function startServer({
         args,
         env,
       });
+      run.analyticsTelemetry = {
+        ...(run.analyticsTelemetry ?? {}),
+        processSpawnStartedAt: Date.now(),
+      };
       child = spawn(invocation.command, invocation.args, {
         env,
         stdio: [stdinMode, 'pipe', 'pipe'],
@@ -11769,6 +11893,10 @@ export async function startServer({
         // breaks paths containing spaces (issue #315).
         windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       });
+      run.analyticsTelemetry = {
+        ...(run.analyticsTelemetry ?? {}),
+        processSpawnedAt: Date.now(),
+      };
       run.child = child;
       // Schedule release of the antigravity model lock once agy's
       // --log-file confirms the chosen model was propagated to the
@@ -12075,6 +12203,13 @@ export async function startServer({
     // in the close handler suppresses the buffer when the output is an
     // OAuth prompt; otherwise the flush below sends the chunks in order.
     const plaintextStdoutBuffer: string[] = [];
+    // Arrival time of the first buffered plain-text stdout chunk
+    // (antigravity). First-token timing is stamped from this value only
+    // when the buffer is actually flushed to the client at close time. If
+    // the auth-prompt guard suppresses the buffer (the OAuth login URL is
+    // printed to stdout), no token ever reaches the user, so TTFT must not
+    // be recorded for that failure mode. See PR #3412.
+    let firstBufferedStdoutAt: number | null = null;
     // Tracks whether any stream the run is using actually emitted user-
     // visible content. Only the streams routed through `sendAgentEvent`
     // contribute to this flag; ACP sessions and plain stdout streams are
@@ -12095,6 +12230,29 @@ export async function startServer({
       'tool_result',
       'artifact',
     ]);
+    // First-token timing must reflect when the user actually starts seeing
+    // model output, so only token-producing events qualify. `tool_use` is
+    // deliberately excluded: a run that opens with a Read/Glob/MCP call would
+    // otherwise stamp `firstTokenAt` before any `text_delta` streamed,
+    // making `time_to_first_token_ms` / `spawn_to_first_token_ms` under-report
+    // TTFT for tool-first runs. `thinking_delta` stays in because it is the
+    // first visible model activity the user perceives.
+    const FIRST_TOKEN_AGENT_EVENT_TYPES = new Set([
+      'text_delta',
+      'thinking_delta',
+    ]);
+    const noteFirstTokenAt = (timestamp = Date.now()) => {
+      if (run.analyticsTelemetry?.firstTokenAt) return;
+      run.analyticsTelemetry = {
+        ...(run.analyticsTelemetry ?? {}),
+        firstTokenAt: timestamp,
+      };
+    };
+    const noteFirstTokenFromAgentEvent = (ev) => {
+      if (ev?.type && FIRST_TOKEN_AGENT_EVENT_TYPES.has(ev.type)) {
+        noteFirstTokenAt();
+      }
+    };
 
     // Per-run role-marker guard for non-Claude structured streams (#3247).
     // Claude has its own per-message guards in claude-stream.ts.
@@ -12211,6 +12369,7 @@ export async function startServer({
       }
       lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
       noteAgentActivity();
+      noteFirstTokenFromAgentEvent(ev);
       if (ev?.type && SUBSTANTIVE_AGENT_EVENT_TYPES.has(ev.type)) {
         agentProducedOutput = true;
       }
@@ -12226,6 +12385,7 @@ export async function startServer({
       const claude = createClaudeStreamHandler((ev) => {
         lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
         noteAgentActivity();
+        noteFirstTokenFromAgentEvent(ev);
         send('agent', ev);
         // Claude uses per-message guards (claude-stream.ts) rather than the
         // run-scoped guard above, so its `fabricated_role_marker` events
@@ -12294,6 +12454,7 @@ export async function startServer({
       const copilot = createCopilotStreamHandler((ev) => {
         lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
         noteAgentActivity();
+        noteFirstTokenFromAgentEvent(ev);
         if (ev?.type === 'text_delta' && typeof ev.delta === 'string') {
           emitGuardedTextDelta(ev.delta);
           return;
@@ -12356,6 +12517,7 @@ export async function startServer({
         ...(def.id === 'amr' ? { modelUnavailableErrorCode: 'AMR_MODEL_UNAVAILABLE' } : {}),
         send: (event, data) => {
           noteAgentActivity();
+          if (event === 'agent') noteFirstTokenFromAgentEvent(data);
           if (def.id === 'amr' && event === 'error') {
             const failure = classifyAmrAccountFailure(
               [
@@ -12397,9 +12559,13 @@ export async function startServer({
       // the OAuth URL before forwarding it to the client as assistant
       // text. agy exits 0 after printing the auth URL on stdout, so the
       // chunks would otherwise arrive before the close-time classifier
-      // detects them as an auth prompt.
+      // detects them as an auth prompt. First-token timing is deliberately
+      // NOT stamped here — only the first chunk's arrival time is recorded,
+      // and `firstTokenAt` is stamped from it at flush time so the
+      // suppressed OAuth-prompt path never reports a TTFT (PR #3412).
       child.stdout.on('data', (chunk) => {
         noteAgentActivity();
+        if (firstBufferedStdoutAt === null) firstBufferedStdoutAt = Date.now();
         plaintextStdoutBuffer.push(String(chunk));
       });
     } else {
@@ -12409,6 +12575,7 @@ export async function startServer({
         const text = typeof chunk === 'string' ? chunk : String(chunk);
         const safe = guardTextDelta(text);
         if (safe.length > 0) {
+          noteFirstTokenAt();
           send('stdout', { chunk: safe });
         }
         if (runGuard.contaminated && !runWarned) {
@@ -12722,7 +12889,13 @@ export async function startServer({
       // Flush buffered plain-text stdout (antigravity) that was not
       // suppressed by the auth-prompt guard above. Send each chunk in
       // order before finishing so the assistant text arrives before the
-      // run's `finished` event.
+      // run's `finished` event. Stamp first-token timing here — and only
+      // here — using the first chunk's arrival time, so the OAuth-prompt
+      // path (which returns before this flush) never records a TTFT for
+      // output the user never saw (PR #3412).
+      if (plaintextStdoutBuffer.length > 0 && firstBufferedStdoutAt !== null) {
+        noteFirstTokenAt(firstBufferedStdoutAt);
+      }
       for (const chunk of plaintextStdoutBuffer) {
         send('stdout', { chunk });
       }
@@ -12844,6 +13017,7 @@ export async function startServer({
       assistantMessageId,
       clientRequestId: `orbit-${trigger}-${randomUUID()}`,
       agentId,
+      mediaExecution: defaultMediaExecutionPolicy(),
     });
     upsertMessage(db, conversationId, {
       id: `orbit-user-${run.id}`,
@@ -13230,7 +13404,6 @@ export async function startServer({
     if (analyticsContext) {
       const reqBody = (req.body || {}) as Record<string, unknown>;
       const runInsertId = newInsertId();
-      const runStartedAt = Date.now();
       // Configure-state triplet — v2 schema requires every event to carry
       // these so PostHog dashboards can split run lifecycle by execution
       // setup. Web-side captures inherit them from a PostHog global
@@ -13400,13 +13573,28 @@ export async function startServer({
         properties: baseProps,
         insertId: runInsertId,
       });
-      design.runs.wait(run).then((status: {
+      design.runs.wait(run).then(async (status: {
         status: string;
         error?: string | null;
         errorCode?: string | null;
         exitCode?: number | null;
         signal?: string | null;
       }) => {
+        // Langfuse eligibility must be re-derived at completion time, not
+        // reused from a launch-time snapshot. A long-running run can have the
+        // user flip telemetry consent or the relay config mid-flight; the
+        // Langfuse sink (`reportRunCompletedFromDaemon`) re-reads app config
+        // when the run ends, so PostHog's `langfuse_expected` /
+        // `langfuse_delivery_status` / `langfuse_drop_reason` must read the
+        // same completion-time eligibility to stay aligned. See PR #3412
+        // review.
+        const appCfgAtFinish = await readAppConfig(RUNTIME_DATA_DIR).catch(
+          () => ({} as Record<string, unknown>),
+        );
+        const langfuseDeliveryForAnalytics = deriveLangfuseDeliveryState(
+          (appCfgAtFinish as { telemetry?: Record<string, unknown> }).telemetry ?? {},
+          readTelemetrySinkConfig(),
+        );
         // `deriveRunErrorCode` is the invariant: when `result === 'failed'`
         // it always returns a non-empty string so dashboards keyed on
         // `error_code` never see a blank cell. Live in `run-result.ts`
@@ -13414,22 +13602,39 @@ export async function startServer({
         // child close without error event, etc.).
         const result = runResultFromStatus(status.status);
         const errorCode = deriveRunErrorCode(status);
+        const failure = classifyRunFailure({
+          result,
+          status,
+          ...(errorCode ? { errorCode } : {}),
+          agentId: run.agentId,
+          events: run.events,
+        });
         // ACP reports { type:'status', label:'model', model:<id> } after
         // session/new; stream adapters report { type:'status',
         // label:'initializing', model:<id> } at run start. The scan must
         // not short-circuit on usage before reaching the model signal —
         // see `scanRunEventsForFinishedProps` for the invariant.
-        const { inputTokens, outputTokens, agentReportedModel } =
-          scanRunEventsForFinishedProps(run.events, reqBody.model);
-        const haveUsage = inputTokens !== undefined || outputTokens !== undefined;
-        const totalTokens =
-          inputTokens !== undefined && outputTokens !== undefined
-            ? inputTokens + outputTokens
-            : undefined;
-        const finishedModelId =
-          typeof reqBody.model === 'string' && reqBody.model.trim()
-            ? modelIdForTracking(reqBody.model)
-            : modelIdForTracking(agentReportedModel);
+        const usageAnalytics = scanRunEventsForUsageAnalytics(
+          run.events,
+          reqBody.model,
+          userQueryTokens,
+        );
+        const analyticsCapturedAt = Date.now();
+        const timingAnalytics = summarizeRunTimingAnalytics({
+          runCreatedAt: run.createdAt,
+          runUpdatedAt: run.updatedAt,
+          analyticsCapturedAt,
+          telemetry: run.analyticsTelemetry,
+          events: run.events,
+        });
+        const diagnosticsAnalytics = summarizeRunDiagnosticsForAnalytics({
+          events: run.events,
+          exitCode: status.exitCode ?? null,
+          signal: status.signal ?? null,
+        });
+        const finishedModelId = hasExplicitRequestedModelForAnalytics(reqBody.model)
+          ? modelIdForTracking(reqBody.model)
+          : modelIdForTracking(usageAnalytics.agent_reported_model);
         design.analytics.capture({
           eventName: 'run_finished',
           context: analyticsContext,
@@ -13471,12 +13676,47 @@ export async function startServer({
               // day one; can be sourced later from a font-audit hook.
               missing_font_count: 0,
             } : {}),
-            total_duration_ms: Date.now() - runStartedAt,
+            ...timingAnalytics,
+            ...diagnosticsAnalytics,
+            langfuse_trace_id: run.id,
+            ...langfuseDeliveryForAnalytics,
             ...(errorCode ? { error_code: errorCode } : {}),
-            ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
-            ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
-            ...(totalTokens !== undefined ? { total_tokens: totalTokens } : {}),
-            ...(haveUsage ? { token_count_source: 'provider_usage' } : {}),
+            ...(failure ?? {}),
+            ...(usageAnalytics.input_tokens !== undefined
+              ? { input_tokens: usageAnalytics.input_tokens }
+              : {}),
+            ...(usageAnalytics.input_tokens_provider !== undefined
+              ? { input_tokens_provider: usageAnalytics.input_tokens_provider }
+              : {}),
+            ...(usageAnalytics.input_tokens_effective !== undefined
+              ? { input_tokens_effective: usageAnalytics.input_tokens_effective }
+              : {}),
+            ...(usageAnalytics.output_tokens !== undefined
+              ? { output_tokens: usageAnalytics.output_tokens }
+              : {}),
+            ...(usageAnalytics.total_tokens !== undefined
+              ? { total_tokens: usageAnalytics.total_tokens }
+              : {}),
+            ...(usageAnalytics.cache_read_input_tokens !== undefined
+              ? { cache_read_input_tokens: usageAnalytics.cache_read_input_tokens }
+              : {}),
+            ...(usageAnalytics.cache_creation_input_tokens !== undefined
+              ? {
+                  cache_creation_input_tokens:
+                    usageAnalytics.cache_creation_input_tokens,
+                }
+              : {}),
+            ...(usageAnalytics.uncached_input_tokens !== undefined
+              ? { uncached_input_tokens: usageAnalytics.uncached_input_tokens }
+              : {}),
+            ...(usageAnalytics.estimated_context_tokens !== undefined
+              ? { estimated_context_tokens: usageAnalytics.estimated_context_tokens }
+              : {}),
+            ...(usageAnalytics.cache_hit_ratio !== undefined
+              ? { cache_hit_ratio: usageAnalytics.cache_hit_ratio }
+              : {}),
+            cache_token_source: usageAnalytics.cache_token_source,
+            token_count_source: usageAnalytics.token_count_source,
           },
           insertId: `${runInsertId}-finish`,
         });
@@ -13778,6 +14018,7 @@ export async function startServer({
       assistantMessageId,
       clientRequestId: `routine-${trigger}-${randomUUID()}`,
       agentId,
+      mediaExecution: defaultMediaExecutionPolicy(),
       ...(resolvedRoutineSnapshot?.ok
         ? {
             appliedPluginSnapshotId: resolvedRoutineSnapshot.snapshotId,

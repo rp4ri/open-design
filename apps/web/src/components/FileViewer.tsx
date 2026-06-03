@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import { Button, Input, Select } from '@open-design/components';
 import { APP_CHROME_FILE_ACTIONS_ID, APP_CHROME_FILE_ACTIONS_SELECTOR } from './AppChromeHeader';
 import {
   anonymizeArtifactId,
@@ -275,6 +276,11 @@ type InspectTarget = {
 const MAX_CACHED_SLIDE_STATES = 64;
 const htmlPreviewSlideState = new Map<string, SlideState>();
 const MAX_CACHED_PREVIEW_VIEWPORTS = 128;
+// Grace window before the inspect hover card is torn down. Long enough to absorb
+// the async iframe mouseout (od:comment-leave) that fires when the pointer slides
+// onto the card or hops back onto the element under it, short enough to read as
+// an immediate dismiss when the pointer really leaves.
+const HOVER_CARD_DISMISS_DELAY_MS = 80;
 const htmlPreviewViewportState = new Map<string, PreviewViewportId>();
 const MARKDOWN_CODE_BLOCK_ATTR = 'data-markdown-code-block';
 const MARKDOWN_COPY_BLOCK_ATTR = 'data-copy-code-block';
@@ -713,13 +719,42 @@ function manualEditFloatingPanelStyle(
     pad,
     Math.min(targetTop, Math.max(pad, canvasHeight - panelHeight - pad)),
   );
+  // Height is left to the content (auto): a short inspector (e.g. typography
+  // only) should be a compact card, not a tall half-empty panel. The cap only
+  // engages for long inspectors, at which point the scroll body takes over.
   return {
     left,
     top,
     width: panelWidth,
-    height: panelHeight,
-    maxHeight: `calc(100% - ${pad * 2}px)`,
+    maxHeight: panelHeight,
   };
+}
+
+// Anchors the hover "edit params" affordance to the top-right corner of the
+// hovered element, just inside its bounds so moving the cursor from the
+// element onto the icon does not drop the hover. Uses the same iframe→canvas
+// coordinate basis as the floating inspector panel.
+function manualEditHoverIconStyle(
+  target: ManualEditTarget,
+  previewScale: number,
+  canvasSize: PreviewCanvasSize | undefined,
+): CSSProperties {
+  const scale = Number.isFinite(previewScale) && previewScale > 0 ? previewScale : 1;
+  const iconSize = 26;
+  const inset = 4;
+  const canvasWidth = canvasSize?.width ?? 1200;
+  const canvasHeight = canvasSize?.height ?? 800;
+  const targetTop = target.rect.y * scale;
+  const targetRight = (target.rect.x + target.rect.width) * scale;
+  const left = Math.max(
+    inset,
+    Math.min(targetRight - iconSize - inset, canvasWidth - iconSize - inset),
+  );
+  const top = Math.max(
+    inset,
+    Math.min(targetTop + inset, canvasHeight - iconSize - inset),
+  );
+  return { left, top, width: iconSize, height: iconSize };
 }
 
 export function cancelManualEditPendingStyleSnapshot(
@@ -2365,12 +2400,11 @@ export function CommentSidePanel({
       {selectedCount > 0 ? (
         <div className="comment-side-selectbar" data-testid="comment-side-selectbar">
           <span className="comment-side-selectcount">{t('chat.comments.nSelected', { n: selectedCount })}</span>
-          <button type="button" className="ghost" onClick={onClearSelection}>
+          <Button variant="ghost" onClick={onClearSelection}>
             {t('chat.comments.clear')}
-          </button>
-          <button
-            type="button"
-            className="primary"
+          </Button>
+          <Button
+            variant="primary"
             data-testid="comment-side-send-claude"
             disabled={sending || sendDisabled}
             onClick={() => void onSendSelected()}
@@ -2380,7 +2414,7 @@ export function CommentSidePanel({
               : queueOnSend
                 ? t('chat.annotationQueue')
                 : t('chat.comments.sendToChat')}
-          </button>
+          </Button>
         </div>
       ) : null}
       {composer ? <div className="comment-side-composer">{composer}</div> : null}
@@ -2629,9 +2663,9 @@ function InspectPanel({
           <strong title={target.label || target.elementId}>{target.label || target.elementId}</strong>
           <code title={target.selector}>{target.elementId}</code>
         </div>
-        <button type="button" className="ghost" onClick={onClose} aria-label="Close inspect">
+        <Button variant="ghost" onClick={onClose} aria-label="Close inspect">
           ×
-        </button>
+        </Button>
       </header>
 
       {target.clickedDescendant ? (
@@ -2654,14 +2688,14 @@ function InspectPanel({
         <div className="inspect-section-label">Colors</div>
         <div className="inspect-row">
           <label htmlFor="ip-color">Text</label>
-          <input
+          <Input
             id="ip-color"
             data-testid="inspect-color"
             type="color"
             value={colorHex}
             onChange={(e) => setVal('color', e.target.value)}
           />
-          <input
+          <Input
             type="text"
             value={colorHex}
             onChange={(e) => setVal('color', e.target.value)}
@@ -2670,14 +2704,14 @@ function InspectPanel({
         </div>
         <div className="inspect-row">
           <label htmlFor="ip-bg">Background</label>
-          <input
+          <Input
             id="ip-bg"
             data-testid="inspect-bg"
             type="color"
             value={bgHex}
             onChange={(e) => setVal('background-color', e.target.value)}
           />
-          <input
+          <Input
             type="text"
             value={bgHex}
             onChange={(e) => setVal('background-color', e.target.value)}
@@ -2704,7 +2738,7 @@ function InspectPanel({
         </div>
         <div className="inspect-row">
           <label htmlFor="ip-fw">Weight</label>
-          <select
+          <Select
             id="ip-fw"
             value={fontWeight}
             onChange={(e) => setVal('font-weight', e.target.value)}
@@ -2712,11 +2746,11 @@ function InspectPanel({
             {['100', '300', '400', '500', '600', '700', '800', '900'].map((w) => (
               <option key={w} value={w}>{w}</option>
             ))}
-          </select>
+          </Select>
         </div>
         <div className="inspect-row">
           <label htmlFor="ip-ta">Align</label>
-          <select
+          <Select
             id="ip-ta"
             value={textAlign}
             onChange={(e) => setVal('text-align', e.target.value)}
@@ -2724,7 +2758,7 @@ function InspectPanel({
             {['left', 'center', 'right', 'justify'].map((a) => (
               <option key={a} value={a}>{a}</option>
             ))}
-          </select>
+          </Select>
         </div>
       </section>
 
@@ -2761,25 +2795,23 @@ function InspectPanel({
       </section>
 
       <footer className="inspect-panel-footer">
-        <button
-          type="button"
-          className="ghost"
+        <Button
+          variant="ghost"
           onClick={() => {
             setDraft({});
             onResetElement(target.elementId);
           }}
         >
           Reset element
-        </button>
-        <button
-          type="button"
-          className="primary"
+        </Button>
+        <Button
+          variant="primary"
           data-testid="inspect-save"
           disabled={saving}
           onClick={onSaveToSource}
         >
           {saving ? 'Saving…' : justSaved ? 'Saved ✓' : 'Save to source'}
-        </button>
+        </Button>
       </footer>
       {error ? <div className="inspect-panel-error">{error}</div> : null}
     </aside>
@@ -4461,6 +4493,8 @@ function HtmlViewer({
   }, []);
 const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([]);
   const [selectedManualEditTarget, setSelectedManualEditTarget] = useState<ManualEditTarget | null>(null);
+  const [manualEditHoverTarget, setManualEditHoverTarget] = useState<ManualEditTarget | null>(null);
+  const [manualEditPageStylesOpen, setManualEditPageStylesOpen] = useState(false);
   const [manualEditPanelPosition, setManualEditPanelPosition] = useState<{ left: number; top: number } | null>(null);
   const selectedManualEditTargetIdRef = useRef<string | null>(null);
   const [manualEditDraft, setManualEditDraft] = useState<ManualEditDraft>(() => emptyManualEditDraft());
@@ -4486,7 +4520,45 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
   );
   const [activeCommentTarget, setActiveCommentTarget] = useState<PreviewCommentSnapshot | null>(null);
   const [hoveredCommentTarget, setHoveredCommentTarget] = useState<PreviewCommentSnapshot | null>(null);
+  // True while the pointer is physically over the floating hover card. The card
+  // sits on top of the preview iframe, so reaching it makes the iframe fire a
+  // mouseout -> od:comment-leave. We ignore that leave while pinned so the card
+  // (and its selectable values) stays put instead of unmounting and flickering.
+  // The pointer cannot be over the iframe and the host card at once, so a fresh
+  // od:comment-hover never races this; only the card's own leave clears it.
+  const hoverCardPinnedRef = useRef(false);
+  // Tearing the card down is always deferred by a beat rather than done
+  // synchronously. The iframe's mouseout (od:comment-leave) arrives async via
+  // postMessage; the card's own mouseenter and the next od:comment-hover are the
+  // signals that the pointer actually landed on the card or back on the element
+  // it overlaps. Deferring lets those cancel the dismiss before it lands.
+  // Synchronous teardown raced ahead of them: the card flickered on the way in
+  // and vanished the moment you moved off it back onto the element it described.
+  const hoverCardDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelHoverCardDismiss = useCallback(() => {
+    if (hoverCardDismissTimerRef.current !== null) {
+      clearTimeout(hoverCardDismissTimerRef.current);
+      hoverCardDismissTimerRef.current = null;
+    }
+  }, []);
+  const scheduleHoverCardDismiss = useCallback(() => {
+    if (hoverCardDismissTimerRef.current !== null) clearTimeout(hoverCardDismissTimerRef.current);
+    hoverCardDismissTimerRef.current = setTimeout(() => {
+      hoverCardDismissTimerRef.current = null;
+      // hoverCardPinnedRef tracks "pointer is physically over the card". If it
+      // got (re-)pinned while we waited, this now-stale dismiss must not fire.
+      if (!hoverCardPinnedRef.current) setHoveredCommentTarget(null);
+    }, HOVER_CARD_DISMISS_DELAY_MS);
+  }, []);
   const [hoveredPodMemberId, setHoveredPodMemberId] = useState<string | null>(null);
+  // If the card unmounts for any other reason while the pointer is still over
+  // it (its onMouseLeave never fires), drop the pin so later leaves dismiss
+  // normally instead of being swallowed forever.
+  useEffect(() => {
+    if (!hoveredCommentTarget) hoverCardPinnedRef.current = false;
+  }, [hoveredCommentTarget]);
+  // Don't let a pending dismiss outlive the component.
+  useEffect(() => cancelHoverCardDismiss, [cancelHoverCardDismiss]);
   const [activePreviewCommentId, setActivePreviewCommentId] = useState<string | null>(null);
   const [liveCommentTargets, setLiveCommentTargets] = useState<Map<string, PreviewCommentSnapshot>>(() => new Map());
   const liveCommentTargetsRef = useRef(liveCommentTargets);
@@ -5362,12 +5434,22 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
         return;
       }
       if (data.type === 'od:comment-leave') {
-        setHoveredCommentTarget(null);
+        // Already firmly on the card — nothing to dismiss.
+        if (hoverCardPinnedRef.current) return;
+        // The pointer left the element. It may be sliding onto the floating card
+        // (which overlaps the iframe) or hopping toward an adjacent element —
+        // both should keep the card up. Defer the dismiss so the card's
+        // mouseenter or the next comment-hover can cancel it; only a leave with
+        // nothing following actually tears the card down.
+        scheduleHoverCardDismiss();
         return;
       }
       if (data.type === 'od:comment-hover') {
         const snapshot = snapshotFromData(data);
         if (!snapshot.elementId || !isValidCommentOverlayPosition(snapshot.position)) return;
+        // Pointer landed on an element — cancel any deferred dismiss so moving
+        // from the card back onto the element it describes keeps the card.
+        cancelHoverCardDismiss();
         setHoveredCommentTarget((current) => (
           current && commentSnapshotEqual(current, snapshot) ? current : snapshot
         ));
@@ -5382,6 +5464,7 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
         const snapshot = snapshotFromData(data);
         if (!snapshot.elementId || !isValidCommentOverlayPosition(snapshot.position)) return;
         const shouldOpenComposer = boardMode || commentCreateMode;
+        cancelHoverCardDismiss();
         setActiveCommentTarget((current) => (shouldOpenComposer ? snapshot : current));
         setHoveredCommentTarget(snapshot);
         setLiveCommentTargets((current) => new Map(current).set(snapshot.elementId, snapshot));
@@ -5430,7 +5513,7 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [activeCommentTarget, boardMode, boardTool, commentPortalHost, file.name, isOurPreviewIframeSource, previewComments]);
+  }, [activeCommentTarget, boardMode, boardTool, cancelHoverCardDismiss, commentPortalHost, file.name, isOurPreviewIframeSource, previewComments, scheduleHoverCardDismiss]);
 
   useEffect(() => {
     if (!boardMode || !activeCommentTarget || activeCommentTarget.selectionKind === 'pod') return;
@@ -5445,6 +5528,8 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
     if (!manualEditMode) {
       setManualEditTargets([]);
       setSelectedManualEditTarget(null);
+      setManualEditHoverTarget(null);
+      setManualEditPageStylesOpen(false);
       setManualEditPanelPosition(null);
       setManualEditError(null);
       manualEditPendingStyleRef.current = null;
@@ -5471,12 +5556,27 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
         return;
       }
       if (data.type === 'od-edit-select') {
+        setManualEditHoverTarget(null);
         void selectManualEditTarget(data.target);
         return;
       }
       if (data.type === 'od-edit-hover') {
-        if (data.target.id !== selectedManualEditTargetIdRef.current) {
-          void selectManualEditTarget(data.target);
+        // Hover only surfaces a lightweight "edit params" affordance; it must
+        // NOT switch the pinned inspector. The panel changes only when the
+        // user clicks that affordance (or a container/image body), so moving
+        // the cursor across the canvas never yanks the panel away mid-edit.
+        setManualEditHoverTarget(
+          data.target.id === selectedManualEditTargetIdRef.current ? null : data.target,
+        );
+        return;
+      }
+      if (data.type === 'od-edit-background') {
+        // Clicking empty canvas deselects and opens the compact page-styles
+        // card — only meaningful for full HTML documents.
+        setManualEditHoverTarget(null);
+        if (typeof source === 'string' && isManualEditFullHtmlDocument(source)) {
+          void clearManualEditTargetSelection();
+          setManualEditPageStylesOpen(true);
         }
         return;
       }
@@ -5616,19 +5716,19 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
     return true;
   }
 
-  function cancelManualEditModeAndExit() {
-    cancelManualEditStyleDraft();
-    selectedManualEditTargetIdRef.current = null;
-    setSelectedManualEditTarget(null);
-    setManualEditPanelPosition(null);
-    setManualEditDraft(emptyManualEditDraft(sourceRef.current ?? ''));
-    setManualEditError(null);
-    setManualEditMode(false);
-    refreshSrcDocPreviewAfterManualEditExit();
-    postSelectedManualEditTargetToIframe(null);
+  // Clears the hover affordance and re-arms the iframe's per-element hover
+  // dedupe so re-entering the same element re-announces it. Called from the
+  // workspace's own mouseleave (host-side), NOT the iframe's mouseleave — the
+  // affordance overlays the iframe, so reacting to the iframe leaving would
+  // yank it out from under the cursor and strobe on/off.
+  function clearManualEditHover() {
+    setManualEditHoverTarget(null);
+    const win = iframeRef.current?.contentWindow;
+    if (win) win.postMessage({ type: 'od-edit-hover-reset' }, '*');
   }
 
   async function selectManualEditTarget(target: ManualEditTarget) {
+    setManualEditPageStylesOpen(false);
     if (manualEditPendingStyleRef.current?.id !== target.id) cancelManualEditStyleDraft();
     const base = sourceRef.current ?? '';
     const fields = readManualEditFields(base, target.id);
@@ -5652,6 +5752,26 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
     setManualEditPanelPosition(null);
     setManualEditDraft(emptyManualEditDraft(sourceRef.current ?? ''));
     setManualEditError(null);
+  }
+
+  // The inspector is scoped to one element (or the page). Closing it should
+  // only collapse the panel and keep the user in edit mode — exiting edit is
+  // the toolbar toggle's job. Dismiss flushes any in-flight tweak first so
+  // nothing is lost; cancel reverts the in-flight unsaved tweak instead.
+  async function dismissManualEditPanel() {
+    const ok = await flushManualEditStyleSave();
+    if (!ok) return;
+    if (selectedManualEditTarget) void clearManualEditTargetSelection();
+    else setManualEditPageStylesOpen(false);
+  }
+
+  function cancelManualEditPanel() {
+    if (selectedManualEditTarget) {
+      void clearManualEditTargetSelection();
+    } else {
+      cancelManualEditStyleDraft();
+      setManualEditPageStylesOpen(false);
+    }
   }
 
   async function applyManualEdit(patch: ManualEditPatch, label: string): Promise<boolean> {
@@ -6863,7 +6983,14 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
     localCommentSideDockActive && commentSidePanelCollapsed ? 'comment-preview-layer-dock-collapsed' : '',
     boardSideDockStacked ? 'comment-preview-layer-side-dock-stacked' : '',
   ].filter(Boolean).join(' ');
-  const manualEditPanel = manualEditMode ? (
+  // Edit mode opens clean: the inspector only appears once the user pins an
+  // element (click its hover affordance / a container) or opens page styles by
+  // clicking the empty canvas. No more full-height panel popping on toggle.
+  const manualEditPageCardActive =
+    manualEditMode && !selectedManualEditTarget && manualEditPageStylesOpen;
+  const manualEditPanelActive =
+    manualEditMode && (!!selectedManualEditTarget || manualEditPageCardActive);
+  const manualEditPanel = manualEditPanelActive ? (
     <ManualEditPanel
       targets={manualEditTargets}
       selectedTarget={selectedManualEditTarget}
@@ -6888,13 +7015,13 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
         void clearManualEditTargetSelection();
       }}
       onExit={() => {
-        void exitManualEditModeAfterFlush();
+        void dismissManualEditPanel();
       }}
       onCancelDraft={() => {
-        cancelManualEditModeAndExit();
+        cancelManualEditPanel();
       }}
       onSaveDraft={() => {
-        void exitManualEditModeAfterFlush();
+        void dismissManualEditPanel();
       }}
       onUndo={() => {
         void undoManualEdit();
@@ -6902,6 +7029,7 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
       onRedo={() => {
         void redoManualEdit();
       }}
+      floatingClassName={manualEditPageCardActive ? 'manual-edit-page-card' : undefined}
       floatingStyle={selectedManualEditTarget
         ? {
             ...manualEditFloatingPanelStyle(
@@ -6911,8 +7039,8 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
             ),
             ...(manualEditPanelPosition ?? {}),
           }
-        : undefined}
-      onFloatingPositionChange={setManualEditPanelPosition}
+        : { top: 12, right: 12, width: 320 }}
+      onFloatingPositionChange={selectedManualEditTarget ? setManualEditPanelPosition : undefined}
       onPickImage={async (pickedFile) => {
         const result = await uploadProjectFiles(projectId, [pickedFile]);
         const uploaded = result.uploaded[0];
@@ -6925,6 +7053,30 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
       }}
     />
   ) : null;
+  const manualEditHoverAffordance =
+    manualEditMode &&
+    manualEditHoverTarget &&
+    manualEditHoverTarget.id !== selectedManualEditTarget?.id ? (
+      <button
+        type="button"
+        className="manual-edit-hover-action"
+        data-testid="manual-edit-hover-open"
+        aria-label={t('manualEdit.editParams')}
+        title={t('manualEdit.editParams')}
+        style={manualEditHoverIconStyle(
+          manualEditHoverTarget,
+          overlayPreviewScale,
+          previewBodySize,
+        )}
+        onClick={() => {
+          const target = manualEditHoverTarget;
+          setManualEditHoverTarget(null);
+          void selectManualEditTarget(target);
+        }}
+      >
+        <Icon name="sliders" size={15} />
+      </button>
+    ) : null;
   const activeComposerComment = activePreviewCommentId
     ? visibleSideComments.find((comment) => comment.id === activePreviewCommentId) ?? null
     : null;
@@ -7208,33 +7360,6 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
                   ) : null}
                 </div>
               ) : null}
-            </>
-          ) : null}
-          {!showPreviewToolbarControls ? (
-            <>
-              <button
-                type="button"
-                className={`viewer-action viewer-comment-toggle${boardMode && !commentCreateMode && boardTool === 'inspect' ? ' active' : ''}`}
-                data-testid="board-mode-toggle"
-                title={t('fileViewer.comment')}
-                aria-label={t('fileViewer.comment')}
-                aria-pressed={boardMode && !commentCreateMode && boardTool === 'inspect'}
-                onClick={activateCommentTool}
-              >
-                <RemixIcon name="chat-new-line" size={14} />
-                <span>{t('fileViewer.comment')}</span>
-              </button>
-              <button
-                type="button"
-                className={`viewer-action viewer-comment-toggle${boardMode && commentCreateMode ? ' active' : ''}`}
-                data-testid="comment-panel-toggle"
-                title={t('chat.tabComments')}
-                aria-pressed={boardMode && commentCreateMode}
-                onClick={activateCommentCreateTool}
-              >
-                <RemixIcon name="message-3-line" size={14} />
-                <span>{t('chat.tabComments')}</span>
-              </button>
             </>
           ) : null}
         </div>
@@ -7545,8 +7670,10 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
             className={`${manualEditMode ? 'manual-edit-workspace' : commentPreviewLayoutClass} preview-viewport preview-viewport-${previewViewport}`}
             data-testid={manualEditMode ? undefined : 'comment-preview-layout'}
             style={previewViewportStyle(previewViewport, previewScale, boardPreviewCanvasSize, boardPreviewScaleOptions)}
+            onMouseLeave={manualEditMode ? clearManualEditHover : undefined}
           >
             {manualEditPanel}
+            {manualEditHoverAffordance}
             <div
               className={manualEditMode ? 'manual-edit-canvas' : 'comment-preview-canvas'}
               data-testid={manualEditMode ? undefined : 'comment-preview-canvas'}
@@ -7737,7 +7864,18 @@ const [manualEditTargets, setManualEditTargets] = useState<ManualEditTarget[]>([
               ) : null}
               {commentComposer}
               {boardMode && !commentCreateMode && hoveredCommentTarget && (!activeCommentTarget || commentPortalHost) ? (
-                <AnnotationHoverPopover target={hoveredCommentTarget} scale={overlayPreviewScale} />
+                <AnnotationHoverPopover
+                  target={hoveredCommentTarget}
+                  scale={overlayPreviewScale}
+                  onMouseEnter={() => {
+                    hoverCardPinnedRef.current = true;
+                    cancelHoverCardDismiss();
+                  }}
+                  onMouseLeave={() => {
+                    hoverCardPinnedRef.current = false;
+                    scheduleHoverCardDismiss();
+                  }}
+                />
               ) : null}
               {/*
                 Hint banner for Inspect / Picker modes. The bridge in
