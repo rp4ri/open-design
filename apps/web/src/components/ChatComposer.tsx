@@ -23,7 +23,7 @@ import {
   trackFileUploadResult,
 } from '../analytics/events';
 import { deriveUploadCohort } from '../analytics/upload-tracking';
-import { projectRawUrl, uploadProjectFiles, openFolderDialog, fetchConnectors } from "../providers/registry";
+import { projectRawUrl, uploadProjectFiles, openFolderDialog } from "../providers/registry";
 import { patchProject } from "../state/projects";
 import { fetchMcpServers } from "../state/mcp";
 import type { McpServerConfig, McpTemplate } from "../state/mcp";
@@ -43,6 +43,7 @@ import type {
 import { buildVisualAnnotationAttachment, commentTargetDisplayName } from '../comments';
 import { Icon, type IconName } from "./Icon";
 import { SessionModeToggle } from './SessionModeToggle';
+import { ComposerPlusMenu } from './ComposerPlusMenu';
 import { PluginDetailsModal } from "./PluginDetailsModal";
 import { PluginsSection, type PluginsSectionHandle } from "./PluginsSection";
 import { BUILT_IN_PETS, CUSTOM_PET_ID } from "./pet/pets";
@@ -58,6 +59,8 @@ import {
 import { CaretFloatingLayer } from './composer/CaretFloatingLayer';
 import { ANNOTATION_EVENT, type AnnotationEventDetail } from "./PreviewDrawOverlay";
 import { DesignSystemSwitchPicker } from "./DesignSystemSwitchPicker";
+import { listenForConnectorsChanged } from './connectors-events';
+import { fetchConnectorCatalogSnapshot } from './connectors-state';
 
 type TranslateFn = (key: keyof Dict, vars?: Record<string, string | number>) => string;
 
@@ -199,6 +202,7 @@ const DESIGN_TOOLBOX_ACTIONS: DesignToolboxAction[] = [
 interface Props {
   projectId: string | null;
   projectFiles: ProjectFile[];
+  activeProjectFileName?: string | null;
   streaming: boolean;
   sessionMode?: ChatSessionMode;
   onSessionModeChange?: (mode: ChatSessionMode) => void;
@@ -231,6 +235,11 @@ interface Props {
   // Opens settings on the External MCP tab. Wired from ChatPane → App.
   // The composer's `/mcp` slash command and the MCP picker button route here.
   onOpenMcpSettings?: () => void;
+  // The "+" menu's "add plugin" / "add connector" rows route to the home
+  // surfaces (plugin registry / connector integrations). Wired from
+  // ChatPane → ProjectView → App. Omitted → the add rows are hidden.
+  onBrowsePlugins?: () => void;
+  onOpenConnectors?: () => void;
   // Optional pet wiring. The composer no longer renders a visible pet
   // entry, but existing manual `/pet` commands still route here.
   petConfig?: AppConfig['pet'];
@@ -334,6 +343,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
     {
       projectId,
       projectFiles,
+      activeProjectFileName = null,
       streaming,
       sessionMode = 'design',
       onSessionModeChange,
@@ -347,6 +357,8 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
       onSend,
       onStop,
       onOpenMcpSettings,
+      onBrowsePlugins,
+      onOpenConnectors,
       petConfig,
       onAdoptPet,
       onTogglePet,
@@ -378,6 +390,11 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
   ) {
     const t = useT();
     const analytics = useAnalytics();
+    const activeFileContext =
+      projectMetadata?.importedFrom === 'folder' && activeProjectFileName
+        ? activeProjectFileName
+        : null;
+    const activeFileDisplayName = activeFileContext ? lastPathSegment(activeFileContext) : null;
     const [draft, setDraft] = useState(() => initialDraft ?? loadComposerDraft(draftStorageKey) ?? "");
     const composerRootRef = useRef<HTMLDivElement | null>(null);
     // Synchronous mirror of `draft`. Event handlers that mutate the draft off
@@ -447,9 +464,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
     // leading sliders icon that hosts project context, MCP, Import actions,
     // and a shortcut to open the full Settings dialog. Replaces the previous
     // row of three standalone buttons (which overflowed in narrow chats).
-    const [toolsOpen, setToolsOpen] = useState(false);
-    const [toolsTab, setToolsTab] = useState<ToolsTab>('plugins');
-    const [designToolboxOpen, setDesignToolboxOpen] = useState(false);
+    // The "+" menu (ComposerPlusMenu) owns its own open / submenu state.
     // Defer the (large) plugin / MCP / connector fetches until the composer is
     // actually used — first focus, the tools popover opening, an @/slash
     // trigger, or a pre-seeded draft. An untouched empty composer (e.g. a home
@@ -463,10 +478,6 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
     // host. Replaces the old textareaRef + manual selection plumbing. IME
     // composition guarding now lives inside the editor's command handlers.
     const editorRef = useRef<LexicalComposerInputHandle | null>(null);
-    const toolsMenuRef = useRef<HTMLDivElement | null>(null);
-    const toolsTriggerRef = useRef<HTMLButtonElement | null>(null);
-    const designToolboxMenuRef = useRef<HTMLDivElement | null>(null);
-    const designToolboxTriggerRef = useRef<HTMLButtonElement | null>(null);
     const petEnabled = Boolean(onAdoptPet && onTogglePet);
     const linkedDirs = projectMetadata?.linkedDirs ?? [];
     const visibleWorkspaceContext =
@@ -516,52 +527,14 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
       setDismissedWorkspaceContextId(null);
     }, [activeWorkspaceContextId]);
 
-    useEffect(() => {
-      if (!toolsOpen) return;
-      function onPointer(e: MouseEvent) {
-        const target = e.target as Node;
-        if (toolsMenuRef.current?.contains(target)) return;
-        if (toolsTriggerRef.current?.contains(target)) return;
-        setToolsOpen(false);
-      }
-      function onKey(e: KeyboardEvent) {
-        if (e.key === 'Escape') setToolsOpen(false);
-      }
-      document.addEventListener('mousedown', onPointer);
-      document.addEventListener('keydown', onKey);
-      return () => {
-        document.removeEventListener('mousedown', onPointer);
-        document.removeEventListener('keydown', onKey);
-      };
-    }, [toolsOpen]);
-
-    useEffect(() => {
-      if (!designToolboxOpen) return;
-      function onPointer(e: MouseEvent) {
-        const target = e.target as Node;
-        if (designToolboxMenuRef.current?.contains(target)) return;
-        if (designToolboxTriggerRef.current?.contains(target)) return;
-        setDesignToolboxOpen(false);
-      }
-      function onKey(e: KeyboardEvent) {
-        if (e.key === 'Escape') setDesignToolboxOpen(false);
-      }
-      document.addEventListener('mousedown', onPointer);
-      document.addEventListener('keydown', onKey);
-      return () => {
-        document.removeEventListener('mousedown', onPointer);
-        document.removeEventListener('keydown', onKey);
-      };
-    }, [designToolboxOpen]);
-
     // Latch `composerEngaged` true on the first real interaction so the
     // deferred fetches below run exactly once, when they are actually needed.
     useEffect(() => {
       if (composerEngaged) return;
-      if (draft.trim().length > 0 || toolsOpen || designToolboxOpen || mention || slash) {
+      if (draft.trim().length > 0 || mention || slash) {
         setComposerEngaged(true);
       }
-    }, [composerEngaged, designToolboxOpen, draft, toolsOpen, mention, slash]);
+    }, [composerEngaged, draft, mention, slash]);
 
     // Lazy-fetch the user's external MCP servers list (once engaged) so the
     // `/mcp …` slash palette and the composer's MCP button popover have
@@ -605,12 +578,27 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
     useEffect(() => {
       if (!composerEngaged) return;
       let cancelled = false;
-      void fetchConnectors().then((rows) => {
+      void fetchConnectorCatalogSnapshot().then((rows) => {
         if (cancelled) return;
         setConnectors(rows.filter((connector) => connector.status === 'connected'));
       });
       return () => {
         cancelled = true;
+      };
+    }, [composerEngaged]);
+
+    useEffect(() => {
+      if (!composerEngaged) return;
+      let cancelled = false;
+      async function refreshConnectors() {
+        const rows = await fetchConnectorCatalogSnapshot({ refreshDiscovery: true });
+        if (cancelled) return;
+        setConnectors(rows.filter((connector) => connector.status === 'connected'));
+      }
+      const stopListening = listenForConnectorsChanged(() => void refreshConnectors());
+      return () => {
+        cancelled = true;
+        stopListening();
       };
     }, [composerEngaged]);
 
@@ -657,30 +645,6 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
     // Resolve which tabs to surface in the consolidated tools popover.
     // Plugins is always visible while a project is active so users can
     // apply context without leaving the composer. MCP shows when wired by
-    // the parent (App); Import is always available. Pet controls stay out
-    // of the project context picker so the @ panel remains project-scoped.
-    const availableTabs = useMemo<ToolsTab[]>(() => {
-      const tabs: ToolsTab[] = [];
-      if (projectId) {
-        tabs.push('plugins');
-        tabs.push('skills');
-      }
-      if (onOpenMcpSettings) tabs.push('mcp');
-      tabs.push('import');
-      return tabs;
-    }, [projectId, onOpenMcpSettings]);
-
-    // When the popover opens, snap the active tab to the first available one
-    // so the user never lands on an empty / hidden tab if their config
-    // changes mid-session.
-    useEffect(() => {
-      if (!toolsOpen) return;
-      if (!availableTabs.includes(toolsTab)) {
-        const first = availableTabs[0];
-        if (first) setToolsTab(first);
-      }
-    }, [toolsOpen, availableTabs, toolsTab]);
-
     // Catalog of supported slash commands. Each entry shows up in the
     // popover when the user types `/` in the composer. The `insert`
     // value is what we drop into the draft when the user picks the
@@ -916,6 +880,8 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
       setStagedMcpServers([]);
       setStagedConnectors([]);
       setStagedWorkspaceContexts([]);
+      pluginsSectionRef.current?.clear();
+      setActiveAppliedPlugin(null);
       setUploadError(null);
       setMention(null);
       setMentionTab('all');
@@ -966,7 +932,18 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
     ): boolean {
       setStreamingAnnotationSendPending(false);
       if (!prompt && attachments.length === 0 && nextCommentAttachments.length === 0) return false;
-      onSend(prompt, attachments, nextCommentAttachments, meta);
+      const nextAttachments =
+        activeFileContext && !attachments.some((attachment) => attachment.path === activeFileContext)
+          ? [
+              {
+                path: activeFileContext,
+                name: activeFileDisplayName ?? activeFileContext,
+                kind: 'file' as const,
+              },
+              ...attachments,
+            ]
+          : attachments;
+      onSend(prompt, nextAttachments, nextCommentAttachments, meta);
       reset();
       return true;
     }
@@ -1055,7 +1032,6 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
 
     function applyDesignToolboxDraft(prompt: string) {
       replaceEditorDraft(prompt);
-      setDesignToolboxOpen(false);
       editorRef.current?.focus();
     }
 
@@ -1556,10 +1532,6 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
       anchorRect: CaretRect | null;
     }) {
       setCaretRect(anchorRect);
-      if (nextMention) {
-        setToolsOpen(false);
-        setDesignToolboxOpen(false);
-      }
       if (nextMention && !mention) {
         setMentionTab('all');
       } else if (!nextMention) {
@@ -1925,7 +1897,11 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
 
     return (
       <div
-        className={`composer${dragActive ? " drag-active" : ""}`}
+        className={[
+          'composer',
+          dragActive ? 'drag-active' : '',
+          activeFileContext ? 'composer-active-file-mode' : '',
+        ].filter(Boolean).join(' ')}
         data-testid="chat-composer"
         ref={composerRootRef}
         onDragOver={(e) => {
@@ -2010,6 +1986,16 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
               ))}
             </div>
           ) : null}
+          {activeFileContext ? (
+            <div
+              className="composer-active-file"
+              data-testid="composer-active-file"
+              title={activeFileContext}
+            >
+              <span className="composer-active-file__label">{t('chat.activeFileEditingLabel')}</span>
+              <span className="composer-active-file__name">{activeFileContext}</span>
+            </div>
+          ) : null}
           {currentCommentAttachments().length > 0 ? (
             <StagedCommentAttachments
               attachments={currentCommentAttachments()}
@@ -2031,8 +2017,12 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
             <LexicalComposerInput
               ref={editorRef}
               draft={draft}
-              placeholder={t('chat.composerPlaceholder')}
-              title={t('chat.composerPlaceholder')}
+              placeholder={
+                activeFileDisplayName
+                  ? t('chat.activeFilePlaceholder', { file: activeFileDisplayName })
+                  : t('chat.composerPlaceholder')
+              }
+              title={activeFileDisplayName ?? t('chat.composerPlaceholder')}
               knownEntities={composerMentionEntities}
               onChange={handleEditorChange}
               onTrigger={handleEditorTrigger}
@@ -2100,265 +2090,19 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
                 e.target.value = '';
               }}
             />
-            <div className="composer-tools-wrap">
-              <button
-                ref={toolsTriggerRef}
-                type="button"
-                className={`icon-btn composer-tools-trigger od-tooltip${toolsOpen ? ' active' : ''}`}
-                onClick={() => {
-                  setToolsOpen((v) => {
-                    const next = !v;
-                    if (next) {
-                      setComposerEngaged(true);
-                      setDesignToolboxOpen(false);
-                      setMention(null);
-                      setSlash(null);
-                      setSlashIndex(0);
-                      trackChatPanelClick(analytics.track, {
-                        page_name: 'chat_panel',
-                        area: 'chat_panel',
-                        element: 'resources_popover_trigger',
-                      });
-                    }
-                    return next;
-                  });
-                }}
-                title={t('chat.cliSettingsTitle')}
-                data-tooltip={t('chat.cliSettingsTitle')}
-                aria-haspopup="menu"
-                aria-expanded={toolsOpen}
-                aria-label={t('chat.cliSettingsAria')}
-              >
-                <Icon name="sliders" size={15} />
-              </button>
-              <button
-                type="button"
-                data-testid="chat-mention-trigger"
-                className={`icon-btn composer-tools-trigger od-tooltip${mention ? ' active' : ''}`}
-                onClick={() => {
-                  if (mention) {
-                    setMention(null);
-                    setMentionTab('all');
-                    return;
-                  }
-                  setComposerEngaged(true);
-                  setToolsOpen(false);
-                  setDesignToolboxOpen(false);
-                  setSlash(null);
-                  setSlashIndex(0);
-                  editorRef.current?.focus();
-                  editorRef.current?.insertText('@');
-                  trackChatPanelClick(analytics.track, {
-                    page_name: 'chat_panel',
-                    area: 'chat_panel',
-                    element: 'mention_popover_trigger',
-                  });
-                }}
-                title={t('chat.mentionTabsAria')}
-                data-tooltip={t('chat.mentionTabsAria')}
-                aria-haspopup="listbox"
-                aria-controls={mention ? 'mention-listbox' : undefined}
-                aria-expanded={Boolean(mention)}
-                aria-label={t('chat.mentionTabsAria')}
-              >
-                <span className="composer-tools-at" aria-hidden>
-                  @
-                </span>
-              </button>
-              {toolsOpen ? (
-                <div
-                  ref={toolsMenuRef}
-                  className="composer-tools-menu"
-                  role="menu"
-                >
-                  <div className="composer-tools-tabs" role="tablist">
-                    {availableTabs.map((tab) => (
-                      <button
-                        key={tab}
-                        type="button"
-                        role="tab"
-                        aria-selected={toolsTab === tab}
-                        className={`composer-tools-tab${toolsTab === tab ? ' active' : ''}`}
-                        onClick={() => setToolsTab(tab)}
-                      >
-                        {tab === 'plugins' ? (
-                          <>
-                            <Icon name="sparkles" size={12} />
-                            <span>Plugins</span>
-                          </>
-                        ) : null}
-                        {tab === 'skills' ? (
-                          <>
-                            <Icon name="file" size={12} />
-                            <span>Skills</span>
-                          </>
-                        ) : null}
-                        {tab === 'mcp' ? (
-                          <>
-                            <Icon name="link" size={12} />
-                            <span>MCP</span>
-                          </>
-                        ) : null}
-                        {tab === 'import' ? (
-                          <>
-                            <Icon name="import" size={12} />
-                            <span>{t('chat.importLabel')}</span>
-                          </>
-                        ) : null}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="composer-tools-content">
-                    {toolsTab === 'plugins' ? (
-                      <ToolsPluginsPanel
-                        plugins={pluginsForComposer}
-                        activePluginId={activeAppliedPlugin?.pluginId ?? pinnedPluginId}
-                        onApply={async (record) => {
-                          const result = await pluginsSectionRef.current?.applyById(
-                            record.id,
-                            record,
-                          );
-                          if (result) setToolsOpen(false);
-                        }}
-                        onShowDetails={(record) => {
-                          setDetailsRecord(record);
-                          setToolsOpen(false);
-                        }}
-                      />
-                    ) : null}
-                    {toolsTab === 'skills' ? (
-                      <ToolsSkillsPanel
-                        skills={skills}
-                        currentSkillId={currentSkillId}
-                        onPick={async (skill) => {
-                          const applied = await applyProjectSkill(skill);
-                          if (!applied) return;
-                          // Mirror the @-picker skill insert: stage the skill
-                          // and drop an atomic `@<name>` pill at the caret.
-                          setStagedSkills((prev) =>
-                            prev.some((s) => s.id === skill.id)
-                              ? prev
-                              : [...prev, skill],
-                          );
-                          editorRef.current?.insertMention({
-                            token: inlineMentionToken(skill.name),
-                            entity: { id: skill.id, kind: 'skill', label: skill.name },
-                          });
-                          editorRef.current?.focus();
-                          setToolsOpen(false);
-                        }}
-                      />
-                    ) : null}
-                    {toolsTab === 'mcp' && onOpenMcpSettings ? (
-                      <ToolsMcpPanel
-                        servers={enabledMcpServers}
-                        templates={mcpTemplates}
-                        onInsert={(serverId) => {
-                          const server = enabledMcpServers.find((item) => item.id === serverId);
-                          const label = server?.label || serverId;
-                          // Stage the server and insert an atomic `@<label>`
-                          // pill carrying its id, matching the @-picker path.
-                          setStagedMcpServers((current) =>
-                            current.some((item) => item.id === serverId)
-                              ? current
-                              : server
-                                ? [...current, server]
-                                : current,
-                          );
-                          editorRef.current?.insertMention({
-                            token: inlineMentionToken(label),
-                            entity: { id: serverId, kind: 'mcp', label },
-                          });
-                          editorRef.current?.focus();
-                          setToolsOpen(false);
-                        }}
-                        onManage={() => {
-                          setToolsOpen(false);
-                          onOpenMcpSettings?.();
-                        }}
-                      />
-                    ) : null}
-                    {toolsTab === 'import' ? (
-                      <ToolsImportPanel
-                        t={t}
-                        onLinkFolder={async () => {
-                          setToolsOpen(false);
-                          await handleLinkFolder();
-                        }}
-                        currentDesignSystemId={currentDesignSystemId}
-                        onSwitchDesignSystem={
-                          projectId
-                            ? async (designSystemId, title) => {
-                                const ok = await handleSwitchDesignSystem(
-                                  designSystemId,
-                                  title,
-                                );
-                                if (ok) setToolsOpen(false);
-                                return ok;
-                              }
-                            : undefined
-                        }
-                      />
-                    ) : null}
-                  </div>
-                </div>
-              ) : null}
-            </div>
-            <div className="composer-design-toolbox-wrap">
-              <button
-                ref={designToolboxTriggerRef}
-                type="button"
-                className={`icon-btn composer-toolbox-trigger od-tooltip${designToolboxOpen ? ' active' : ''}`}
-                onClick={() => {
-                  setDesignToolboxOpen((v) => {
-                    const next = !v;
-                    if (next) {
-                      setComposerEngaged(true);
-                      setToolsOpen(false);
-                    }
-                    return next;
-                  });
-                }}
-                title={t('chat.designToolbox.tooltip')}
-                data-tooltip={t('chat.designToolbox.tooltip')}
-                aria-haspopup="menu"
-                aria-expanded={designToolboxOpen}
-                aria-label={t('chat.designToolbox.aria')}
-              >
-                <Icon name="lightbulb" size={15} />
-              </button>
-              {designToolboxOpen ? (
-                <div
-                  ref={designToolboxMenuRef}
-                  className="composer-design-toolbox-menu"
-                  role="menu"
-                >
-                  <DesignToolboxPanel
-                    actions={DESIGN_TOOLBOX_ACTIONS}
-                    skills={skills}
-                    plugins={pluginsForComposer}
-                    mcpServers={enabledMcpServers}
-                    mcpTemplates={mcpTemplates}
-                    connectors={connectors}
-                    projectFiles={projectFiles}
-                    activeSkillIds={stagedSkills.map((skill) => skill.id)}
-                    activePluginId={activeAppliedPlugin?.pluginId ?? pinnedPluginId ?? null}
-                    activeMcpServerIds={stagedMcpServers.map((server) => server.id)}
-                    activeConnectorIds={stagedConnectors.map((connector) => connector.id)}
-                    activeFilePaths={staged.map((item) => item.path)}
-                    onLucky={applyLuckyDesignToolboxAction}
-                    onPickAction={applyDesignToolboxAction}
-                    onPickSkill={applyDesignToolboxSkill}
-                    onPickResource={applyDesignToolboxResource}
-                  />
-                </div>
-              ) : null}
-            </div>
-            <Button
-              size="icon"
-              data-testid="chat-attach"
-              onClick={() => {
+            <ComposerPlusMenu
+              triggerTestId="chat-plus-trigger"
+              onOpen={() => setComposerEngaged(true)}
+              connectors={connectors}
+              onPickConnector={insertConnectorMention}
+              onAddConnector={onOpenConnectors}
+              plugins={pluginsForComposer}
+              onPickPlugin={(record) => void insertPluginMention(record)}
+              onAddPlugin={onBrowsePlugins}
+              mcpServers={enabledMcpServers}
+              onPickMcp={insertMcpMention}
+              onAddMcp={onOpenMcpSettings}
+              onAttachFiles={() => {
                 trackChatPanelClick(analytics.track, {
                   page_name: 'chat_panel',
                   area: 'chat_panel',
@@ -2366,23 +2110,34 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
                 });
                 fileInputRef.current?.click();
               }}
-              title={t('chat.attachTitle')}
-              data-tooltip={t('chat.attachTitle')}
-              disabled={uploading}
-              aria-label={t('chat.attachAria')}
-            >
-              {uploading ? (
-                <Icon name="spinner" size={15} />
-              ) : (
-                <Icon name="attach" size={15} />
+              attachLoading={uploading}
+              renderToolbox={(close) => (
+                <DesignToolboxPanel
+                  actions={DESIGN_TOOLBOX_ACTIONS}
+                  skills={skills}
+                  plugins={pluginsForComposer}
+                  mcpServers={enabledMcpServers}
+                  mcpTemplates={mcpTemplates}
+                  connectors={connectors}
+                  projectFiles={projectFiles}
+                  activeSkillIds={stagedSkills.map((skill) => skill.id)}
+                  activePluginId={activeAppliedPlugin?.pluginId ?? pinnedPluginId ?? null}
+                  activeMcpServerIds={stagedMcpServers.map((server) => server.id)}
+                  activeConnectorIds={stagedConnectors.map((connector) => connector.id)}
+                  activeFilePaths={staged.map((item) => item.path)}
+                  onLucky={() => { applyLuckyDesignToolboxAction(); close(); }}
+                  onPickAction={(action) => { applyDesignToolboxAction(action); close(); }}
+                  onPickSkill={(skill) => { applyDesignToolboxSkill(skill); close(); }}
+                  onPickResource={(resource) => { applyDesignToolboxResource(resource); close(); }}
+                />
               )}
-            </Button>
+            />
+            <span className="composer-spacer" />
+            {footerAccessory}
             <SessionModeToggle
               mode={sessionMode}
               onChange={onSessionModeChange}
             />
-            {footerAccessory}
-            <span className="composer-spacer" />
             {showStopButton ? (
               <button
                 type="button"

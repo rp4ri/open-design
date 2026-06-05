@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { ensureRailOpen } from '@/playwright/rail';
 import type { Page } from '@playwright/test';
 import { T } from '@/timeouts';
 
@@ -70,8 +71,18 @@ test('[P0] manual edit inspector previews and persists page and selected element
   await expect.poll(async () => responsivePair.evaluate((el) => getComputedStyle(el).flexDirection)).toBe('row');
 
   await page.getByTestId('manual-edit-mode-toggle').click();
+  await expect(frame.locator('html[data-od-edit-mode]')).toHaveCount(1);
   await expect.poll(async () => responsivePair.evaluate((el) => getComputedStyle(el).flexDirection)).toBe('row');
 
+  await frame.locator('body').evaluate(() => {
+    document.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 1,
+      clientY: 1,
+      view: window,
+    }));
+  });
   await expect(page.locator('.manual-edit-modal')).toContainText('PAGE');
   await expect(page.locator('.manual-edit-tabs')).toHaveCount(0);
   await expect(page.locator('.manual-edit-layer-row')).toHaveCount(0);
@@ -159,7 +170,7 @@ async function selectStyleRowInput(
   label: string,
 ) {
   await frame.locator(selector).click();
-  await expect(page.locator('.manual-edit-modal')).toContainText('TYPOGRAPHY');
+  await expect(page.locator('.manual-edit-modal')).toContainText(section);
   const row = inspectorSection(page, section).locator('.cc-row').filter({ hasText: label }).locator('input');
   await expect(row).toBeVisible();
   return row;
@@ -279,6 +290,7 @@ async function gotoEntryHome(page: Page) {
 }
 
 async function openNewProjectModal(page: Page) {
+  await ensureRailOpen(page);
   await page.getByTestId('entry-nav-new-project').click();
   await expect(page.getByTestId('new-project-modal')).toBeVisible();
   await expect(page.getByTestId('new-project-panel')).toBeVisible();
@@ -347,11 +359,7 @@ async function openDesignFile(page: Page, fileName: string) {
   }
 
   const filePattern = new RegExp(fileName.replace(/\./g, '\\.'), 'i');
-  const fileTabButton = page
-    .locator('.workspace-tab')
-    .filter({ hasText: filePattern })
-    .locator('.workspace-tab__main')
-    .first();
+  const fileTabButton = page.getByRole('tab', { name: filePattern }).first();
   let tabFound = true;
   try {
     await fileTabButton.waitFor({ state: 'visible', timeout: 2_000 });
