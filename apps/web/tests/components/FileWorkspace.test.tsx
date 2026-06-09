@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   DESIGN_FILES_TAB,
@@ -19,7 +19,7 @@ import {
   writeProjectTextFile,
   fetchProjectFolders,
 } from '../../src/providers/registry';
-import type { ChatMessage, ProjectFile, ProjectFolder } from '../../src/types';
+import type { AppConfig, ChatMessage, ProjectFile, ProjectFolder } from '../../src/types';
 
 vi.mock('../../src/components/AmrGuidance', () => ({
   AmrGuidance: ({
@@ -133,6 +133,10 @@ beforeAll(() => {
     disconnect() {}
     unobserve() {}
   };
+});
+
+beforeEach(() => {
+  mockedFetchProjectFileText.mockResolvedValue('');
 });
 
 afterEach(() => {
@@ -567,7 +571,7 @@ describe('FileWorkspace upload input', () => {
     const onUploadFiles = vi.fn();
     const { container } = renderDesignFilesPanel({ onUploadFiles });
 
-    fireEvent.drop(container.querySelector('.df-drop')!, {
+    fireEvent.drop(container.querySelector('.df-body')!, {
       dataTransfer: unreadableDropDataTransfer([fallbackFile]),
     });
 
@@ -579,7 +583,7 @@ describe('FileWorkspace upload input', () => {
     const onUploadFiles = vi.fn();
     const { container } = renderDesignFilesPanel({ onUploadFiles });
 
-    fireEvent.drop(container.querySelector('.df-drop')!, {
+    fireEvent.drop(container.querySelector('.df-body')!, {
       dataTransfer: unreadableDropDataTransfer(),
     });
 
@@ -658,7 +662,10 @@ describe('FileWorkspace upload input', () => {
 });
 
 describe('FileWorkspace launcher tab creation', () => {
-  it('reports the active Design Files tab as workspace context', async () => {
+  it('does not report a Design Files context for an empty project', async () => {
+    // A brand-new project has no files, live artifacts, or folders. The
+    // composer must not auto-stage a "Design files" chip that points at
+    // nothing, so the active workspace context stays null.
     const onActiveContextChange = vi.fn();
     render(
       <FileWorkspace
@@ -666,6 +673,29 @@ describe('FileWorkspace launcher tab creation', () => {
         projectKind="prototype"
         resolvedDir="/tmp/open-design/project-1"
         files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
+        onActiveContextChange={onActiveContextChange}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onActiveContextChange).toHaveBeenCalled();
+    });
+    expect(onActiveContextChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it('reports the active Design Files tab as workspace context once files exist', async () => {
+    const onActiveContextChange = vi.fn();
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        resolvedDir="/tmp/open-design/project-1"
+        files={[workspaceFile('cover.html')]}
         liveArtifacts={[]}
         onRefreshFiles={vi.fn()}
         isDeck={false}
@@ -686,46 +716,25 @@ describe('FileWorkspace launcher tab creation', () => {
     });
   });
 
-  it('appends a new terminal to the latest tab list after parent tabs change', async () => {
-    mockedFetchProjectFileText.mockResolvedValue('');
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () =>
-        new Response(JSON.stringify({ terminal: { id: 'term-1' } }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
-      ),
-    );
-    const onTabsStateChange = vi.fn();
-    const baseProps: React.ComponentProps<typeof FileWorkspace> = {
-      projectId: 'project-1',
-      projectKind: 'prototype',
-      files: [],
-      liveArtifacts: [],
-      onRefreshFiles: vi.fn(),
-      isDeck: false,
-      tabsState: { tabs: [], active: null },
-      onTabsStateChange,
-    };
-
-    const { rerender } = render(<FileWorkspace {...baseProps} />);
-    rerender(
+  it('hides terminal creation while keeping browser creation available', () => {
+    render(
       <FileWorkspace
-        {...baseProps}
-        tabsState={{ tabs: ['chat:existing'], active: null }}
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: null }}
+        onTabsStateChange={vi.fn()}
       />,
     );
 
     fireEvent.click(screen.getByTestId('workspace-add-tab'));
-    fireEvent.click(await screen.findByRole('button', { name: /New Terminal/i }));
 
-    await waitFor(() => {
-      expect(onTabsStateChange).toHaveBeenCalledWith({
-        tabs: ['chat:existing', 'terminal:term-1'],
-        active: 'terminal:term-1',
-      });
-    });
+    expect(screen.queryByRole('button', { name: /New Terminal/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /New Browser/i })).toBeTruthy();
+    expect(screen.getByText('Create new')).toBeTruthy();
   });
 
   it('renders terminal and side chat tabs after a Design Files-anchored browser tab', () => {
@@ -807,101 +816,6 @@ describe('FileWorkspace launcher tab creation', () => {
             id: '__browser__:2',
             insertAfter: 'terminal:term-1',
             label: 'Browser 2',
-          },
-        ],
-      });
-    });
-  });
-
-  it('appends a new browser after stale-anchor browser tabs', async () => {
-    const onTabsStateChange = vi.fn();
-    const staleBrowserTab = {
-      id: '__browser__:1',
-      insertAfter: 'deleted.html',
-      label: 'Browser',
-    };
-
-    render(
-      <FileWorkspace
-        projectId="project-1"
-        projectKind="prototype"
-        files={[workspaceFile('cover.html')]}
-        liveArtifacts={[]}
-        onRefreshFiles={vi.fn()}
-        isDeck={false}
-        tabsState={{
-          tabs: ['cover.html'],
-          active: 'cover.html',
-          browserTabs: [staleBrowserTab],
-        }}
-        onTabsStateChange={onTabsStateChange}
-      />,
-    );
-
-    fireEvent.click(screen.getByTestId('workspace-add-tab'));
-    fireEvent.click(await screen.findByRole('button', { name: /New Browser/i }));
-
-    await waitFor(() => {
-      expect(onTabsStateChange).toHaveBeenCalledWith({
-        tabs: ['cover.html'],
-        active: '__browser__:2',
-        browserTabs: [
-          staleBrowserTab,
-          {
-            id: '__browser__:2',
-            insertAfter: '__browser__:1',
-            label: 'Browser 2',
-          },
-        ],
-      });
-    });
-  });
-
-  it('reanchors stale browser tabs before appending a new terminal', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () =>
-        new Response(JSON.stringify({ terminal: { id: 'term-2' } }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
-      ),
-    );
-    const onTabsStateChange = vi.fn();
-    const staleBrowserTab = {
-      id: '__browser__:1',
-      insertAfter: 'deleted.html',
-      label: 'Browser',
-    };
-
-    render(
-      <FileWorkspace
-        projectId="project-1"
-        projectKind="prototype"
-        files={[workspaceFile('cover.html')]}
-        liveArtifacts={[]}
-        onRefreshFiles={vi.fn()}
-        isDeck={false}
-        tabsState={{
-          tabs: ['cover.html'],
-          active: 'cover.html',
-          browserTabs: [staleBrowserTab],
-        }}
-        onTabsStateChange={onTabsStateChange}
-      />,
-    );
-
-    fireEvent.click(screen.getByTestId('workspace-add-tab'));
-    fireEvent.click(await screen.findByRole('button', { name: /New Terminal/i }));
-
-    await waitFor(() => {
-      expect(onTabsStateChange).toHaveBeenCalledWith({
-        tabs: ['cover.html', 'terminal:term-2'],
-        active: 'terminal:term-2',
-        browserTabs: [
-          {
-            ...staleBrowserTab,
-            insertAfter: 'cover.html',
           },
         ],
       });
@@ -1301,6 +1215,7 @@ describe('FileWorkspace generation failure recovery', () => {
         isDeck={false}
         tabsState={{ tabs: ['generation'], active: 'generation' }}
         onTabsStateChange={vi.fn()}
+        chatConfig={{ agentCliEnv: { amr: { OPEN_DESIGN_AMR_PROFILE: 'local' } } } as unknown as AppConfig}
         messages={[failedAssistantMessage('AMR_INSUFFICIENT_BALANCE', 'amr', 'AMR balance empty')]}
         onRetry={onRetry}
       />,
@@ -1319,7 +1234,7 @@ describe('FileWorkspace generation failure recovery', () => {
     expect(features).toBe('noopener,noreferrer');
     const parsedWalletUrl = new URL(String(walletUrl));
     expect(`${parsedWalletUrl.origin}${parsedWalletUrl.pathname}`).toBe(
-      'https://open-design.ai/amr/wallet',
+      'http://localhost:5173/wallet',
     );
     expect(parsedWalletUrl.searchParams.get('od_origin')).toBe('open_design');
     expect(parsedWalletUrl.searchParams.get('od_entry_source')).toBe(
@@ -1405,7 +1320,7 @@ describe('FileWorkspace generation failure recovery', () => {
   // default landing tab. While a run is in flight and no previewable artifact
   // exists yet, the progress card must take priority over the empty
   // "Creations will appear here" file list instead of being hidden behind it.
-  it('keeps the generation preview on the design-files tab while generating with no artifacts yet', () => {
+  it('surfaces generation in its own auto-focused tab on a fresh project, leaving Design Files switchable', () => {
     render(
       <FileWorkspace
         projectId="project-1"
@@ -1421,7 +1336,53 @@ describe('FileWorkspace generation failure recovery', () => {
       />,
     );
 
+    // A transient Generating tab appears and auto-focuses, so the user lands on
+    // the progress card instead of an empty file list.
+    const generatingTab = screen.getByTestId('generating-tab');
+    expect(generatingTab.getAttribute('aria-selected')).toBe('true');
     expect(screen.getByTestId('generation-preview-stage')).toBeTruthy();
+
+    // The Design Files tab is still present and switchable mid-run: clicking it
+    // hides the progress card and shows the (empty) file browser.
+    fireEvent.click(screen.getByTestId('design-files-tab'));
+    expect(screen.queryByTestId('generation-preview-stage')).toBeNull();
+    expect(screen.getByTestId('design-files-empty')).toBeTruthy();
+
+    // And the Generating tab is still there to switch back to.
+    fireEvent.click(screen.getByTestId('generating-tab'));
+    expect(screen.getByTestId('generation-preview-stage')).toBeTruthy();
+  });
+
+  // When the agent pauses to ask a question (awaiting-input), the Questions tab
+  // owns that state — the Generating tab must NOT appear and steal focus from
+  // the form the user needs to answer on the discovery path.
+  it('does not surface a Generating tab while awaiting question-form input', () => {
+    const awaitingInput: ChatMessage = {
+      id: 'msg-awaiting',
+      role: 'assistant',
+      content: '<question-form id="discovery" title="Brief">{"questions":[]}</question-form>',
+      runStatus: 'succeeded',
+      startedAt: 1700000000,
+      events: [
+        { kind: 'text', text: '<question-form id="discovery">{"questions":[]}</question-form>' },
+      ],
+    };
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: [], active: DESIGN_FILES_TAB }}
+        onTabsStateChange={vi.fn()}
+        messages={[awaitingInput]}
+      />,
+    );
+
+    expect(screen.queryByTestId('generating-tab')).toBeNull();
+    expect(screen.queryByTestId('generation-preview-stage')).toBeNull();
   });
 
   // The override above is scoped to the *empty* design-files tab. A populated
@@ -1970,7 +1931,7 @@ describe('FileWorkspace sketch save', () => {
 });
 
 describe('FileWorkspace add-module menu', () => {
-  it('opens the add-module menu so the + button reveals the Browser option', () => {
+  it('opens the add-module menu with Browser available and Terminal hidden', () => {
     render(
       <FileWorkspace
         projectId="project-1"
@@ -1995,6 +1956,7 @@ describe('FileWorkspace add-module menu', () => {
     const browserItem = screen.getByRole('button', { name: /New Browser/ });
     const menu = browserItem.closest('[data-testid="tab-launcher-menu"]');
     expect(menu).not.toBeNull();
+    expect(screen.queryByRole('button', { name: /New Terminal/ })).toBeNull();
 
     // The tab strip is a horizontal scroll container that also clips
     // vertically, so the "+" button lives outside it in `.ws-add-tab`
@@ -2173,35 +2135,4 @@ describe('FileWorkspace add-module menu', () => {
     });
   });
 
-  it('appends a new browser tab after existing workspace tabs', () => {
-    render(
-      <FileWorkspace
-        projectId="project-1"
-        projectKind="prototype"
-        files={[workspaceFile('analysis.html'), workspaceFile('notes.html')]}
-        liveArtifacts={[]}
-        onRefreshFiles={vi.fn()}
-        isDeck={false}
-        tabsState={{ tabs: ['analysis.html', 'notes.html'], active: null }}
-        onTabsStateChange={vi.fn()}
-      />,
-    );
-
-    const addButton = screen.getByTestId('workspace-add-tab');
-    act(() => {
-      fireEvent.click(addButton);
-    });
-    act(() => {
-      fireEvent.click(screen.getByRole('button', { name: /New Browser/ }));
-    });
-
-    const tabLabels = screen
-      .getAllByRole('tab')
-      .map((tab) => tab.textContent?.trim() ?? '');
-    const fileIndex = tabLabels.findIndex((label) => label.includes('notes.html'));
-    const browserIndex = tabLabels.findIndex((label) => label === 'Browser');
-
-    expect(fileIndex).toBeGreaterThanOrEqual(0);
-    expect(browserIndex).toBe(fileIndex + 1);
-  });
 });

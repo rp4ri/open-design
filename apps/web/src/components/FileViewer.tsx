@@ -4546,7 +4546,13 @@ function HtmlViewer({
     });
   };
   const fireArtifactHeaderClick = (
-    element: 'back' | 'edit' | 'present_dropdown' | 'share_dropdown' | 'settings',
+    element:
+      | 'back'
+      | 'edit'
+      | 'present_dropdown'
+      | 'download_dropdown'
+      | 'share_dropdown'
+      | 'settings',
   ) => {
     trackArtifactHeaderClick(analytics.track, {
       page_name: 'artifact',
@@ -7205,7 +7211,7 @@ function HtmlViewer({
   }, [slideNavRequest?.nonce, slideNavRequest?.slideIndex, effectiveDeck, previewStateKey, slideState?.count]);
 
   const openDownloadMenu = () => {
-    fireArtifactHeaderClick('share_dropdown');
+    fireArtifactHeaderClick('download_dropdown');
     setExportReadyNudge(false);
     markExportReadyNudgeSeen(projectId, file.name);
     setDeployMenuOpen(false);
@@ -8160,13 +8166,12 @@ function HtmlViewer({
                 <div className="share-menu chrome-share-menu">
                   <button
                     type="button"
-                    className="chrome-action chrome-action-secondary chrome-action-with-label"
+                    className="chrome-action chrome-action-secondary chrome-action-with-label chrome-action-text-only"
                     aria-haspopup="menu"
                     aria-expanded={deployMenuOpen}
                     aria-label={shareMenuLabel}
                     onClick={openDeployMenu}
                   >
-                    <RemixIcon name="share-forward-line" size={15} />
                     <span>{shareMenuLabel}</span>
                   </button>
                   {deployMenuOpen ? (
@@ -8304,7 +8309,6 @@ function HtmlViewer({
                     aria-expanded={downloadMenuOpen}
                     onClick={openDownloadMenu}
                   >
-                    <RemixIcon name="download-line" size={15} />
                     <span>{t('fileViewer.download')}</span>
                   </button>
                   {downloadMenuOpen ? (
