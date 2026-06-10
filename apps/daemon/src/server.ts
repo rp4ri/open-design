@@ -27,6 +27,11 @@ import {
 } from './prompts/system.js';
 import { expandHomePrefix, resolveProjectRelativePath } from './home-expansion.js';
 import { resolveProjectRoot } from './project-root.js';
+import {
+  applyBakedPreviews,
+  resolvePluginPreviewsDir,
+  PLUGIN_PREVIEWS_ROUTE,
+} from './plugin-preview-bakes.js';
 import { userFacingAgentLabel } from './user-facing-agent-label.js';
 
 export { resolveProjectRoot };
@@ -234,9 +239,10 @@ import { renderDesignSystemPreview } from './design-system-preview.js';
 import { renderDesignSystemShowcase } from './design-system-showcase.js';
 import { createChatRunService } from './runs.js';
 import { deriveRunErrorCode, runResultFromStatus } from './run-result.js';
-import { classifyRunFailure } from './run-failure-classification.js';
+import { classifyRunFailure, isResumableFailure } from './run-failure-classification.js';
 import { decideSafeRunRetry } from './run-retry-policy.js';
 import {
+  amrUserIdForRunAnalytics,
   hasExplicitRequestedModelForAnalytics,
   scanRunEventsForUsageAnalytics,
   summarizeRunTimingAnalytics,
@@ -1341,12 +1347,40 @@ function resolveDaemonResourceDir(resourceRoot, segment, fallback) {
   return resourceRoot ? path.join(resourceRoot, segment) : fallback;
 }
 
+// Where the daemon reads the baked plugin-preview manifest from. In a packaged
+// build the bundled manifest lives under the resource root (OD_RESOURCE_ROOT,
+// Resources/open-design) like every other resource tree — NOT under PROJECT_ROOT,
+// which for the prebundled daemon resolves to Resources/app (two levels up from
+// the sidecar) and has no data/. An explicit OD_PLUGIN_PREVIEWS_DIR override and
+// the dev PROJECT_ROOT layout still win. Exported for regression coverage.
+export function resolveDaemonPluginPreviewsDir({ env = process.env, resourceRoot, projectRoot }) {
+  // Resolve the override from the injected `env` (absolute passthrough, relative
+  // against projectRoot) rather than re-reading process.env, so the helper is
+  // pure and the override path is actually testable.
+  const override = env.OD_PLUGIN_PREVIEWS_DIR;
+  if (override) {
+    return path.isAbsolute(override) ? override : path.resolve(projectRoot, override);
+  }
+  return resolveDaemonResourceDir(
+    resourceRoot,
+    path.join('data', 'plugin-previews'),
+    path.join(projectRoot, 'data', 'plugin-previews'),
+  );
+}
+
 const DAEMON_RESOURCE_ROOT = resolveDaemonResourceRoot();
 // Built web app lives in `out/` — that's where Next.js writes the static
 // export configured in next.config.ts. The folder name used to be `dist/`
 // when this project shipped with Vite; the daemon serves whatever the
 // frontend toolchain emits, no further config needed.
 const STATIC_DIR = path.join(PROJECT_ROOT, 'apps', 'web', 'out');
+// Baked plugin preview clips (scripts/bake-plugin-previews.mjs). Served at
+// PLUGIN_PREVIEWS_ROUTE; their manifest rewrites html plugins' previews to a
+// cheap poster + hover-play video in the home gallery.
+const PLUGIN_PREVIEWS_DIR = resolveDaemonPluginPreviewsDir({
+  resourceRoot: DAEMON_RESOURCE_ROOT,
+  projectRoot: PROJECT_ROOT,
+});
 const OD_BIN = resolveDaemonCliPath();
 const OD_NODE_BIN = process.execPath;
 const SKILLS_DIR = resolveDaemonResourceDir(
@@ -3021,19 +3055,128 @@ export function createFinalizedMessageTelemetryReporter({
   getAppVersion?: () => any;
   report?: typeof reportRunCompletedFromDaemon;
 }) {
-  return (saved, body = {}) => {
-    if (!shouldReportRunCompletedFromMessage(saved, body)) return;
-    const run = design.runs.get(saved.runId);
-    if (!run || reportedRuns.has(run.id)) return;
-    reportedRuns.add(run.id);
-    void report({
-      db,
-      dataDir,
-      run,
-      persistedRunStatus: saved.runStatus,
-      persistedEndedAt: saved.endedAt,
-      appVersion: getAppVersion(),
+  const appVersionForCapture = () => {
+    const appVersion = getAppVersion();
+    if (typeof appVersion === 'string') return appVersion;
+    if (appVersion && typeof appVersion.version === 'string') return appVersion.version;
+    if (typeof design?.getAppVersion === 'function') return design.getAppVersion();
+    return 'unknown';
+  };
+  const captureResult = ({
+    analyticsContext,
+    conversationId,
+    delivery,
+    durationMs,
+    projectId,
+    reportResult,
+    run,
+    runId,
+    skipReason,
+    status,
+  }) => {
+    if (!analyticsContext || !design?.analytics?.capture || !runId || !delivery) return;
+    const terminalResult = status ? runResultFromStatus(status) : undefined;
+    design.analytics.capture({
+      eventName: 'langfuse_report_result',
+      context: analyticsContext,
+      appVersion: appVersionForCapture(),
+      properties: {
+        page_name: 'chat_panel',
+        area: 'chat_panel',
+        project_id: run?.projectId ?? projectId ?? null,
+        conversation_id: run?.conversationId ?? conversationId ?? null,
+        run_id: runId,
+        langfuse_trace_id: runId,
+        langfuse_expected: delivery.langfuse_expected,
+        langfuse_delivery_status: delivery.langfuse_delivery_status,
+        ...(delivery.langfuse_drop_reason
+          ? { langfuse_drop_reason: delivery.langfuse_drop_reason }
+          : {}),
+        langfuse_report_result: reportResult,
+        langfuse_report_trigger: 'final_message',
+        ...(skipReason ? { langfuse_report_skip_reason: skipReason } : {}),
+        ...(durationMs !== undefined ? { report_duration_ms: durationMs } : {}),
+        ...(terminalResult ? { result: terminalResult } : {}),
+        ...(run?.errorCode ? { error_code: run.errorCode } : {}),
+        ...(run?.agentId ? { agent_provider_id: agentIdToTracking(run.agentId) } : {}),
+        ...(run?.model !== undefined ? { model_id: modelIdForTracking(run.model) } : {}),
+      },
+      insertId: `${runId}-langfuse-report-${reportResult}${skipReason ? `-${skipReason}` : ''}`,
     });
+  };
+  return (saved, body = {}, options = {}) => {
+    if (!shouldReportRunCompletedFromMessage(saved, body)) return;
+    const runId = saved.runId;
+    const run = design.runs.get(runId);
+    if (!run) {
+      captureResult({
+        analyticsContext: options.analyticsContext,
+        conversationId: options.conversationId ?? saved.conversationId,
+        delivery: {
+          langfuse_expected: true,
+          langfuse_delivery_status: 'failed',
+          langfuse_drop_reason: 'network_error',
+        },
+        projectId: options.projectId,
+        reportResult: 'skipped',
+        runId,
+        skipReason: 'run_not_found',
+        status: saved.runStatus,
+      });
+      return;
+    }
+    if (reportedRuns.has(run.id)) {
+      captureResult({
+        analyticsContext: options.analyticsContext,
+        conversationId: options.conversationId ?? saved.conversationId,
+        delivery: {
+          langfuse_expected: true,
+          langfuse_delivery_status: 'failed',
+          langfuse_drop_reason: 'network_error',
+        },
+        projectId: options.projectId,
+        reportResult: 'skipped',
+        run,
+        runId: run.id,
+        skipReason: 'duplicate_run',
+        status: saved.runStatus,
+      });
+      return;
+    }
+    reportedRuns.add(run.id);
+    void (async () => {
+      const start = Date.now();
+      const delivery = await report({
+        db,
+        dataDir,
+        run,
+        persistedRunStatus: saved.runStatus,
+        persistedEndedAt: saved.endedAt,
+        appVersion: getAppVersion(),
+      });
+      const state = delivery ?? {
+        langfuse_expected: true,
+        langfuse_delivery_status: 'accepted',
+      };
+      captureResult({
+        analyticsContext: options.analyticsContext,
+        conversationId: options.conversationId ?? saved.conversationId,
+        delivery: state,
+        durationMs: Date.now() - start,
+        projectId: options.projectId,
+        reportResult: state.langfuse_expected === false
+          ? 'skipped'
+          : state.langfuse_delivery_status === 'accepted'
+            ? 'accepted'
+            : state.langfuse_delivery_status === 'failed'
+              ? 'failed'
+              : 'skipped',
+        run,
+        runId: run.id,
+        skipReason: state.langfuse_expected === false ? 'not_expected' : undefined,
+        status: saved.runStatus,
+      });
+    })();
   };
 }
 
@@ -5392,6 +5535,7 @@ export async function startServer({
       runtime,
       projectRoot: PROJECT_ROOT,
       runsDir: path.join(RUNTIME_DATA_DIR, 'runs'),
+      dataDir: RUNTIME_DATA_DIR,
     }),
   );
 
@@ -6049,6 +6193,10 @@ export async function startServer({
     projects: { getProject: (id: string) => getProject(db, id) },
   });
   app.use('/artifacts', express.static(ARTIFACTS_DIR));
+  app.use(
+    PLUGIN_PREVIEWS_ROUTE,
+    express.static(PLUGIN_PREVIEWS_DIR, { maxAge: '1d', immutable: false }),
+  );
   registerDeployRoutes(app, {
     db,
     http: httpDeps,
@@ -6283,7 +6431,11 @@ export async function startServer({
     });
     // Bump the parent project's updatedAt so the project list re-orders.
     updateProject(db, req.params.id, {});
-    reportFinalizedMessage(saved, m);
+    reportFinalizedMessage(saved, m, {
+      analyticsContext: readAnalyticsContext(req),
+      projectId: req.params.id,
+      conversationId: req.params.cid,
+    });
     res.json({ message: saved });
   });
 
@@ -6923,7 +7075,7 @@ export async function startServer({
   // and snapshot fetch by id (used by run replay tooling).
   app.get('/api/plugins', async (_req, res) => {
     try {
-      const plugins = listInstalledPlugins(db);
+      const plugins = applyBakedPreviews(listInstalledPlugins(db), PLUGIN_PREVIEWS_DIR);
       res.json({ plugins });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -10726,9 +10878,6 @@ export async function startServer({
       console.warn('[custom-instructions] readAppConfig failed', err);
     }
 
-    // Project-level custom instructions from the projects table.
-    const projectInstructions = project?.customInstructions ?? '';
-
     let designSystemBody;
     let designSystemTitle;
     // Compiled (tokens.css + components manifest / components.html)
@@ -10989,7 +11138,6 @@ export async function startServer({
       ...(pluginBlock ? { pluginBlock } : {}),
       ...(activeStageBlocks ? { activeStageBlocks } : {}),
       userInstructions,
-      projectInstructions,
     });
     // The chat handler also needs to know where the active skill lives
     // on disk so it can stage a per-project copy of its side files
@@ -11795,6 +11943,17 @@ export async function startServer({
           : {}),
       });
     };
+    let pendingRpcCloseReason = null;
+    const markRpcCloseReason = (reason) => {
+      pendingRpcCloseReason = reason;
+    };
+    const deriveRpcCloseReason = (status, code, signal) => {
+      if (pendingRpcCloseReason) return pendingRpcCloseReason;
+      if (run.cancelRequested || status === 'canceled') return 'cancel_requested';
+      if (signal) return 'signal';
+      if (typeof code === 'number') return code === 0 ? 'exit_0' : 'exit_nonzero';
+      return 'unknown';
+    };
     const finishWithRetryDecision = (status, code = null, signal = null) => {
       run.analyticsTelemetry = {
         ...(run.analyticsTelemetry ?? {}),
@@ -11821,14 +11980,15 @@ export async function startServer({
         agentId: run.agentId,
         events: run.events,
       });
+      const sideEffects = {
+        ...scanRunEventsForRetrySideEffects(run.events),
+        cancelRequested: !!run.cancelRequested,
+      };
       const decision = decideSafeRunRetry({
         result,
         failure,
         attemptCount: run.retryAttemptCount ?? 0,
-        sideEffects: {
-          ...scanRunEventsForRetrySideEffects(run.events),
-          cancelRequested: !!run.cancelRequested,
-        },
+        sideEffects,
       });
       if (decision.shouldRetry && !design.runs.isTerminal(run.status)) {
         run.retryAttemptCount = decision.retryAttemptIndex;
@@ -11841,7 +12001,64 @@ export async function startServer({
         restartSameRunAfterRetry();
         return true;
       }
+      // Resume-on-failure: a terminal *resumable* failure (transient mid-stream
+      // drop / inactivity) on a session-resuming runtime is not a dead end.
+      // Persist the live CLI session so the next turn in this conversation
+      // continues it (`--resume <id>`) instead of opening a fresh session, and
+      // flag the run so the chat can surface a Continue affordance. The session
+      // id is the one we actually drove this attempt with: the resumed id when
+      // continuing, otherwise the freshly minted id we passed via --session-id.
+      //
+      // Gate on a real *committed* boundary this attempt, not merely on bytes
+      // having reached the UI. A completed tool_use / artifact / live-artifact
+      // corresponds to a block the agent has committed to its session (Claude
+      // commits a tool_use block before running the tool), so `--resume` has
+      // something concrete to pick up. We deliberately EXCLUDE
+      // `userVisibleOutputSeen`: it flips true on the first streamed text
+      // delta, but a single-turn drop can stream a few tokens with
+      // `output_tokens == 0` and never commit a text block — resuming that
+      // continues from the prior user turn (nothing to pick up), which is
+      // exactly the "resume something with nothing to continue" case this
+      // feature is meant to avoid. A text-only turn that is cut therefore stays
+      // a from-scratch restart (auto-retry above or a manual Retry).
+      // NOTE: `userVisibleOutputSeen` cannot by itself distinguish "half a text
+      // block, zero commit" from "a committed text block then more streaming";
+      // until the stream exposes a committed-text signal, tool/artifact blocks
+      // are the only reliable resume boundary.
+      const committedWorkSeen = !!(
+        sideEffects.toolCallSeen ||
+        sideEffects.artifactWriteSeen ||
+        sideEffects.liveArtifactSeen
+      );
+      const liveSessionId = agentResumeCtx.isResuming
+        ? agentResumeCtx.resumeSessionId
+        : agentResumeCtx.newSessionId;
+      const resumableFailure =
+        result === 'failed' &&
+        def.resumesSessionViaCli === true &&
+        !!run.conversationId &&
+        !!liveSessionId &&
+        committedWorkSeen &&
+        isResumableFailure(failure);
+      run.resumable = resumableFailure;
+      if (resumableFailure) {
+        upsertAgentSession(db, {
+          conversationId: run.conversationId,
+          agentId: def.id,
+          sessionId: liveSessionId,
+          stablePromptHash: currentStableHash,
+        });
+      }
       finalizeRetryTelemetry(status, decision, failure, errorCode);
+      const rpcCloseReason = deriveRpcCloseReason(status, code, signal);
+      design.runs.emit(run, 'diagnostic', {
+        type: 'runtime_close',
+        rpc_close_reason: rpcCloseReason,
+        status,
+        ...(typeof code === 'number' ? { exit_code: code } : {}),
+        ...(signal ? { signal } : {}),
+      });
+      pendingRpcCloseReason = null;
       design.runs.finish(run, status, code, signal);
       return false;
     };
@@ -12031,16 +12248,39 @@ export async function startServer({
             agentLaunch,
           )
         : null;
+      const amrModelScope = resolveAmrProfile(modelProbeEnv ?? process.env);
+      // Resolve the AMR model catalog through the SAME shared cache the UI's
+      // `/api/amr/models` endpoint serves (AmrModelLoadingCache): a cached
+      // authoritative `vela model list` when it is hot, otherwise the offline
+      // `vela model preset` seed while a remote refresh runs in the background.
+      //
+      // Why not a fresh `vela model list` per run: that authoritative call
+      // needs network reachability to the AMR gateway AND `$HOME` (the offline
+      // `preset`/`--version` calls need neither), takes up to ~10s, and only
+      // retries a narrow set of network errors. Running it blocking on every
+      // turn turned any transient gateway/timeout/HOME hiccup into a hard
+      // "AMR model … is not available from Vela" — even for a logged-in user
+      // who already picked a real model the picker surfaced from the preset
+      // seed. Under CorpLink/飞连 the call routinely exceeded the timeout, so
+      // AMR became unusable in packaged nightlies. Reusing the cache keeps that
+      // blocking probe off the per-run hot path and degrades to preset instead
+      // of fail-closing; vela's own `session/set_model` remains the final gate.
       let liveModels = [];
       try {
-        liveModels =
-          launchPath && typeof def.fetchModels === 'function'
-            ? ((await def.fetchModels(launchPath, modelProbeEnv)) ?? [])
-            : [];
-      } catch {
+        const probe = await resolveAmrModelProbe();
+        const catalog = await amrModelLoadingCache.get(probe.cacheKey, {
+          fetchPreset: () => fetchVelaPresetModels(probe.launchPath, probe.env),
+          fetchRemote: () => fetchVelaRemoteModelsWithRetry(probe.launchPath, probe.env),
+        });
+        liveModels = catalog.models ?? [];
+      } catch (error) {
+        // Do not swallow silently: a probe failure here is exactly what made
+        // the packaged AMR breakage undiagnosable (the old `catch {}` left no
+        // trace in any log or diagnostics bundle). Record it and degrade to the
+        // remembered catalog below.
+        console.warn('[amr] model catalog preflight probe failed', error);
         liveModels = [];
       }
-      const amrModelScope = resolveAmrProfile(modelProbeEnv ?? process.env);
       const rememberedLiveModels = getRememberedLiveModels(def.id, amrModelScope);
       if (liveModels.length > 0) {
         rememberLiveModels(def.id, liveModels, amrModelScope);
@@ -12049,12 +12289,26 @@ export async function startServer({
       const liveModelIds = new Set(
         liveModels.map((candidate) => candidate?.id).filter(Boolean),
       );
+      // A request that came in as 'default'/empty is normally pre-resolved to a
+      // concrete id via the agent-wide cached model order; if it still is not,
+      // adopt the first catalog entry so the spawn layer always has a real id.
+      const userAskedForDefault =
+        typeof model !== 'string' ||
+        !model.trim() ||
+        model.trim().toLowerCase() === 'default';
+      if (
+        !safeModel ||
+        safeModel === 'default' ||
+        (userAskedForDefault && !liveModelIds.has(safeModel))
+      ) {
+        safeModel = liveModels[0]?.id ?? safeModel ?? null;
+        agentOptions.model = safeModel;
+      }
       if (liveModelIds.size === 0) {
-        // An empty AMR catalog usually means the user is signed out — `vela
-        // models` returns 401 and the catch above leaves `liveModels` empty.
-        // Surface AMR_AUTH_REQUIRED first so the chat shows the relogin
-        // affordance; otherwise the user sees a misleading "choose a model"
-        // when the real fix is to sign in.
+        // The catalog is genuinely empty: even the offline preset seed could
+        // not be read, which almost always means the user is signed out (`vela`
+        // catalog calls 401) or the CLI is unrunnable. Prefer the relogin
+        // affordance over a misleading "choose a model".
         if (def.id === 'amr') {
           const loginStatus = readVelaLoginStatus(
             modelProbeEnv ?? process.env,
@@ -12070,37 +12324,29 @@ export async function startServer({
             return design.runs.finish(run, 'failed', 1, null);
           }
         }
-        send('error', createAmrModelUnavailablePayload(safeModel, {
-          reason: 'model_catalog_unavailable',
-        }));
-        return design.runs.finish(run, 'failed', 1, null);
-      }
-      // `safeModel` was pre-resolved via the agent-wide cached model order,
-      // so a request that came in as 'default' (or empty) is already a
-      // concrete id by this point — `safeModel === 'default'` is rarely true.
-      // If the user actually asked for the agent default and the cached id no
-      // longer appears in the FRESH catalog (e.g. the AMR Link catalog rolled
-      // since `/api/agents` last responded), fall back to `liveModels[0]` from
-      // the fresh probe instead of rejecting their run as `AMR_MODEL_UNAVAILABLE`.
-      const userAskedForDefault =
-        typeof model !== 'string' ||
-        !model.trim() ||
-        model.trim().toLowerCase() === 'default';
-      if (
-        !safeModel ||
-        safeModel === 'default' ||
-        (userAskedForDefault && !liveModelIds.has(safeModel))
-      ) {
-        safeModel = liveModels[0]?.id ?? null;
-        agentOptions.model = safeModel;
-      }
-      if (!safeModel || !liveModelIds.has(safeModel)) {
+        // Logged in but no catalog at all AND no resolvable model: only now is
+        // there nothing safe to forward, so surface the model error.
+        if (!safeModel) {
+          send('error', createAmrModelUnavailablePayload(safeModel, {
+            reason: 'model_catalog_unavailable',
+          }));
+          return design.runs.finish(run, 'failed', 1, null);
+        }
+        // Otherwise fall through with the user's selected model and let vela's
+        // `session/set_model` be the authoritative gate.
+      } else if (!safeModel) {
+        // Catalog known but we could not resolve any model id to forward.
         send('error', createAmrModelUnavailablePayload(
           typeof model === 'string' && model.trim() ? model : safeModel,
           { availableModels: [...liveModelIds] },
         ));
         return design.runs.finish(run, 'failed', 1, null);
       }
+      // NOTE: when the selected model is absent from the (possibly preset-only
+      // or stale) catalog we intentionally do NOT fail-close. The cached/preset
+      // catalog can lag the live one, and a logged-in user picked a concrete
+      // id; vela rejects a truly unsupported model at `session/set_model` with
+      // a precise error, which beats a pre-emptive block on a flaky metadata read.
     }
 
     // Plain-streaming adapters that own a "continue most recent
@@ -13355,10 +13601,12 @@ export async function startServer({
       revokeToolToken('child_exit');
       unregisterChatAgentEventSink();
       if (acpSession?.hasFatalError()) {
+        markRpcCloseReason('fatal_rpc_error');
         return finishWithRetryDecision('failed', code ?? 1, signal ?? null);
       }
       if (agentStreamError) {
-        return finishWithRetryDecision('failed', code ?? 1, signal ?? null);
+        markRpcCloseReason('stream_error');
+        return finishWithRetryDecision('failed', code === 0 ? 1 : (code ?? 1), signal ?? null);
       }
       if (
         code !== 0 &&
@@ -13415,6 +13663,7 @@ export async function startServer({
         trackingSubstantiveOutput &&
         !agentProducedOutput
       ) {
+        markRpcCloseReason('empty_output');
         send('error', createSseErrorPayload(
           'AGENT_EXECUTION_FAILED',
           'Agent completed without producing any output. The model or provider may have returned an empty response — check the agent logs for upstream errors.',
@@ -13480,6 +13729,7 @@ export async function startServer({
         !trackingSubstantiveOutput &&
         !childStdoutSeen
       ) {
+        markRpcCloseReason('empty_output');
         let combinedDetail = `${agentStderrTail}\n${agentStdoutTail}`;
         if (def.id === 'antigravity' && agentLogFilePath) {
           try {
@@ -14235,10 +14485,31 @@ export async function startServer({
       // Without it, a run for an uninstalled agent would still report
       // `available` whenever any unrelated CLI was on PATH — see PR #2285
       // review.
+      // AMR sign-in state is daemon-visible (vela's config file or the
+      // Settings-backed VELA_RUNTIME_KEY/VELA_LINK_URL env config), so the
+      // server-side captures can fill `amrAuthorized` even though BYOK
+      // stays web-only. Merge the configured AMR env exactly like the
+      // /api/integrations/vela/status route and the run launcher do —
+      // env-configured users are signed in to the UI, and dropping the
+      // configured env here would keep reporting them as 'none'.
+      const velaStatusForAnalytics = (() => {
+        try {
+          const configuredAmrEnv = agentCliEnvForAgent(
+            (appCfgForAnalytics as {
+              agentCliEnv?: Parameters<typeof agentCliEnvForAgent>[0];
+            }).agentCliEnv,
+            'amr',
+          );
+          return readVelaLoginStatus(process.env, configuredAmrEnv);
+        } catch {
+          return null;
+        }
+      })();
       const configureGlobals = deriveConfigureGlobals({
         mode: 'daemon',
         agentId: typeof reqBody.agentId === 'string' ? reqBody.agentId : null,
         agents: detectedAgentsForAnalytics,
+        amrAuthorized: velaStatusForAnalytics?.loggedIn === true,
       });
       const promptText =
         typeof reqBody.currentPrompt === 'string'
@@ -14326,6 +14597,7 @@ export async function startServer({
         page_name: isDesignSystemRun ? 'design_system_project' : 'chat_panel',
         area: isDesignSystemRun ? 'design_system_generation' : 'chat_composer',
         ...configureGlobals,
+        ...amrUserIdForRunAnalytics(velaStatusForAnalytics),
         project_id: requestProjectId,
         conversation_id:
           typeof reqBody.conversationId === 'string' ? reqBody.conversationId : null,
@@ -14476,10 +14748,16 @@ export async function startServer({
           telemetry: run.analyticsTelemetry,
           events: run.events,
         });
+        const artifactCount = countNewHtmlArtifacts(run.events);
+        const designSystemCreated = didRunCreateDesignSystemFile(run.events);
+        const previewModuleCount = countDesignSystemPreviewModules(run.events);
         const diagnosticsAnalytics = summarizeRunDiagnosticsForAnalytics({
           events: run.events,
           exitCode: status.exitCode ?? null,
           signal: status.signal ?? null,
+          cancelRequested: !!run.cancelRequested,
+          firstTokenSeen: Boolean(run.analyticsTelemetry?.firstTokenAt),
+          artifactWriteSeen: artifactCount > 0 || designSystemCreated || previewModuleCount > 0,
         });
         const finishedModelId = hasExplicitRequestedModelForAnalytics(reqBody.model)
           ? modelIdForTracking(reqBody.model)
@@ -14514,7 +14792,7 @@ export async function startServer({
             // artifact?" funnel on PostHog. See `run-artifacts.ts`
             // for the dedup semantics; tested in
             // `tests/run-artifacts.test.ts`.
-            artifact_count: countNewHtmlArtifacts(run.events),
+            artifact_count: artifactCount,
             // True when the run raised an AskUserQuestion clarification
             // card. Clarification turns inherently produce no artifact, so
             // the dashboard excludes them from the "run finished -> has
@@ -14531,8 +14809,8 @@ export async function startServer({
               // succeeded; the run-artifacts inspector reuses the
               // same Write/Edit pairing it already does for HTML
               // artifact counts, just keyed on `DESIGN.md`.
-              design_system_created: didRunCreateDesignSystemFile(run.events),
-              preview_module_count: countDesignSystemPreviewModules(run.events),
+              design_system_created: designSystemCreated,
+              preview_module_count: previewModuleCount,
               // `missing_font_count` defaults to 0 — the agent flow
               // doesn't emit a structured "missing fonts" signal yet.
               // Kept on the wire so the dashboard has the column from
