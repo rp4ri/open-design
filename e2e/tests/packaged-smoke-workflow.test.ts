@@ -221,10 +221,19 @@ describe("packaged smoke workflow", () => {
     expect(workflow).toContain("secrets.RELEASE_BOT_APP_ID");
 
     // Only a non-draft, same-repo PR authored by the release bot, targeting release/v*, is merged.
-    expect(workflow).toContain("steps.pr.outputs.author == 'open-design-release-bot[bot]'");
+    expect(workflow).toContain("steps.pr.outputs.author == 'app/open-design-release-bot'");
     expect(workflow).toContain("steps.pr.outputs.cross == 'false'");
     expect(workflow).toContain("steps.pr.outputs.draft == 'false'");
     expect(workflow).toContain('startswith("release/v")');
+
+    // A human commit pushed on top of the cherry-pick (conflict resolution, CI fix) is never
+    // reviewed, so auto-approve/merge require pristine == 'true': every commit's committer is
+    // github-actions[bot]. The committers are paginated across all commits and any non-bot one
+    // fails the count. Otherwise the PR falls back to human review.
+    expect(workflow).toContain("steps.pr.outputs.pristine == 'true'");
+    expect(workflow).toContain('.[].committer.login // "none"');
+    expect(workflow).toContain("--paginate");
+    expect(workflow).toContain("grep -Fvxc 'github-actions[bot]'");
 
     // The PR is resolved from the run's authoritative workflow_run.pull_requests association
     // (filtered to the release/* base at exactly the run's SHA), not a branch-name guess, and the
@@ -242,13 +251,14 @@ describe("packaged smoke workflow", () => {
     expect(workflow).toContain("gh pr review");
     expect(workflow).toContain("--approve");
     const approveStep = sectionBetween(workflow, "Approve the clean backport", "gh pr review");
-    expect(approveStep).toContain("steps.pr.outputs.author == 'open-design-release-bot[bot]'");
+    expect(approveStep).toContain("steps.pr.outputs.author == 'app/open-design-release-bot'");
+    expect(approveStep).toContain("steps.pr.outputs.pristine == 'true'");
     expect(approveStep).toContain("github.token");
 
     // The Feishu failure path carries the same identity gates, so a fork / non-bot backport-*
     // PR can't spam the release group.
     const feishuStep = sectionBetween(workflow, "Notify Feishu on failed backport CI", "FEISHU_WEBHOOK");
-    expect(feishuStep).toContain("steps.pr.outputs.author == 'open-design-release-bot[bot]'");
+    expect(feishuStep).toContain("steps.pr.outputs.author == 'app/open-design-release-bot'");
     expect(feishuStep).toContain("steps.pr.outputs.cross == 'false'");
   });
 
