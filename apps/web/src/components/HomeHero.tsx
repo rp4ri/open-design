@@ -75,7 +75,6 @@ import { applyFacetSelection } from './plugins-home/facets';
 import { inferPluginPreview } from './plugins-home/preview';
 import { pluginSubfacetLabel } from './plugins-home/subfacetLabel';
 import { ComposerPlusMenu } from './ComposerPlusMenu';
-import { SessionModeToggle } from './SessionModeToggle';
 import { TemplatePicker } from './home-hero/TemplatePicker';
 import { LibraryPicker } from './LibraryPicker';
 import { assetTitle } from './LibraryAssetMeta';
@@ -129,7 +128,7 @@ interface Props {
   onSubmit: HomeHeroSubmitHandler;
   // Send pressed on an EMPTY composer while the placeholder carousel is
   // showing: the host seeds the prompt with `scenario.text`, binds the
-  // scenario's template, and creates the project — one-click "just start".
+  // scenario's template, and creates the project -- one-click "just start".
   onSubmitScenario?: (scenario: PlaceholderScenario) => void;
   sessionMode?: ChatSessionMode;
   onSessionModeChange?: (mode: ChatSessionMode) => void;
@@ -265,8 +264,6 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
     onSubmit,
     onSubmitScenario = () => undefined,
     firstRunGuide,
-    sessionMode = 'design',
-    onSessionModeChange,
     activePluginTitle,
     activePluginIsExplicit = false,
     activePluginRecord = null,
@@ -423,6 +420,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
   // template switch before the carousel reports the new pool's first scenario.
   const carouselSubmittable =
     carouselActive &&
+    !pluginsLoading &&
     carouselScenario !== null &&
     carouselScenarios.some((scenario) => scenario.id === carouselScenario.id);
   const sendEnabled = canSubmit || carouselSubmittable;
@@ -1624,13 +1622,6 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
             ) : null}
           </div>
           <div className="home-hero__foot-right">
-            {onSessionModeChange ? (
-              <SessionModeToggle
-                mode={sessionMode}
-                onChange={onSessionModeChange}
-                disabled={submitting}
-              />
-            ) : null}
             {executionSwitcher ? (
               <div className="home-hero__execution-switcher">
                 {executionSwitcher}
