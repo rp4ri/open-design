@@ -29,6 +29,7 @@ import type {
   InputFieldSpec,
   InstalledPluginRecord,
   McpServerConfig,
+  WorkspaceContextItem,
 } from '@open-design/contracts';
 import { DesignSystemPicker } from './DesignSystemPicker';
 import type { SkillSummary } from '../types';
@@ -76,12 +77,20 @@ import { applyFacetSelection } from './plugins-home/facets';
 import { inferPluginPreview } from './plugins-home/preview';
 import { pluginSubfacetLabel } from './plugins-home/subfacetLabel';
 import { ComposerPlusMenu } from './ComposerPlusMenu';
+import { ContextChipHoverCard } from './ContextChipHoverCard';
+import { workspaceContextDetailLine, workspaceContextKindLabel } from './workspace-context';
+import { FigmaHelpModal } from './FigmaHelpModal';
 import { TemplatePicker } from './home-hero/TemplatePicker';
 import { LibraryPicker } from './LibraryPicker';
+import { SessionModeToggle } from './SessionModeToggle';
 import { assetTitle } from './LibraryAssetMeta';
 import { libraryAssetRawUrl } from '../providers/registry';
 import type { LibraryAsset } from '@open-design/contracts';
 import { WorkingDirPicker } from './WorkingDirPicker';
+import {
+  ProjectReferenceModal,
+  type ProjectReferenceSelection,
+} from './ProjectReferenceModal';
 import {
   LexicalComposerInput,
   type LexicalComposerInputHandle,
@@ -90,8 +99,8 @@ import {
 import { CaretFloatingLayer } from './composer/CaretFloatingLayer';
 import { PlaceholderCarousel } from './home-hero/PlaceholderCarousel';
 import {
+  buildPlaceholderScenarios,
   PLACEHOLDER_BASE_HINT_KEY,
-  PLACEHOLDER_SCENARIO_DEFS,
   type PlaceholderScenario,
 } from './home-hero/placeholderScenarios';
 
@@ -144,6 +153,7 @@ interface Props {
   onClearActiveChip?: () => void;
   activeSkillId?: string | null;
   activeSkillTitle?: string | null;
+  activeSkillRecord?: SkillSummary | null;
   onClearActiveSkill?: () => void;
   selectedPluginContexts?: InstalledPluginRecord[];
   selectedMcpContexts?: McpServerConfig[];
@@ -155,13 +165,17 @@ interface Props {
   contextOnlyPlugins?: InstalledPluginRecord[];
   contextOnlyMcpServers?: McpServerConfig[];
   contextOnlyConnectors?: ConnectorDetail[];
+  contextWorkspaceItems?: WorkspaceContextItem[];
   onRemovePluginContext?: (pluginId: string) => void;
   onRemoveMcpContext?: (serverId: string) => void;
   onRemoveConnectorContext?: (connectorId: string) => void;
+  onAddWorkspaceContext?: (item: WorkspaceContextItem) => void;
+  onRemoveWorkspaceContext?: (id: string) => void;
   onAddPlugin?: () => void;
   onAddConnector?: () => void;
   onAddMcp?: () => void;
   onOpenPluginDetails?: (record: InstalledPluginRecord) => void;
+  onOpenSkillDetails?: (skill: SkillSummary) => void;
   pluginInputFields?: InputFieldSpec[];
   pluginInputValues?: Record<string, unknown>;
   pluginInputTemplate?: string | null;
@@ -206,7 +220,8 @@ interface Props {
   showActivePluginChip?: boolean;
   workingDir?: string | null;
   recentDirs?: string[];
-  onPickWorkingDir?: () => void;
+  onPickWorkingDir?: () => Promise<string | null> | string | null | void;
+  onPickLocalCodeDir?: () => Promise<string | null> | string | null | void;
   onSelectRecentWorkingDir?: (dir: string) => void;
   onClearWorkingDir?: () => void;
   onExamplePromptStatusChange?: (info: ExamplePromptInfo | null) => void;
@@ -258,6 +273,7 @@ const EMPTY_STAGED_FILES: File[] = [];
 const EMPTY_SKILLS: SkillSummary[] = [];
 const EMPTY_MCP_OPTIONS: McpServerConfig[] = [];
 const EMPTY_CONNECTOR_OPTIONS: ConnectorDetail[] = [];
+const EMPTY_WORKSPACE_ITEMS: WorkspaceContextItem[] = [];
 
 export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
   {
@@ -266,12 +282,15 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
     onPromptChange,
     onSubmit,
     onSubmitScenario = () => undefined,
+    sessionMode = 'design',
+    onSessionModeChange,
     firstRunGuide,
     activePluginTitle,
     activePluginIsExplicit = false,
     activePluginRecord = null,
     activeSkillId = null,
     activeSkillTitle = null,
+    activeSkillRecord = null,
     activeChipId,
     onClearActivePlugin,
     onClearActiveChip = onClearActivePlugin,
@@ -280,13 +299,17 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
     contextOnlyPlugins = EMPTY_PLUGIN_CONTEXTS,
     contextOnlyMcpServers = EMPTY_MCP_OPTIONS,
     contextOnlyConnectors = EMPTY_CONNECTOR_OPTIONS,
+    contextWorkspaceItems = EMPTY_WORKSPACE_ITEMS,
     onRemovePluginContext = () => undefined,
     onRemoveMcpContext = () => undefined,
     onRemoveConnectorContext = () => undefined,
+    onAddWorkspaceContext = () => undefined,
+    onRemoveWorkspaceContext = () => undefined,
     onAddPlugin = () => undefined,
     onAddConnector = () => undefined,
     onAddMcp = () => undefined,
     onOpenPluginDetails = () => undefined,
+    onOpenSkillDetails = () => undefined,
     pluginInputFields = EMPTY_INPUT_FIELDS,
     pluginInputValues = EMPTY_PLUGIN_INPUT_VALUES,
     onPluginInputValuesChange = () => undefined,
@@ -323,6 +346,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
     workingDir = null,
     recentDirs = [],
     onPickWorkingDir,
+    onPickLocalCodeDir,
     onSelectRecentWorkingDir,
     onClearWorkingDir,
     onExamplePromptStatusChange,
@@ -338,7 +362,10 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
   const [hoveredPlugin, setHoveredPlugin] = useState<InstalledPluginRecord | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [libraryPickerOpen, setLibraryPickerOpen] = useState(false);
+  const [projectReferenceOpen, setProjectReferenceOpen] = useState(false);
+  const [figmaHelpOpen, setFigmaHelpOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const homeHeroRef = useRef<HTMLElement | null>(null);
   // Two-flash attention pulse on the send button; armed via the
   // imperative `pulseSend()` handle, cleared when the animation ends.
   const [sendAttention, setSendAttention] = useState(false);
@@ -394,21 +421,21 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
   // with nothing bound we cycle the full set. Memoised by chip + locale so the
   // reference only changes on a real switch, which restarts the carousel.
   const carouselScenarios = useMemo<PlaceholderScenario[]>(() => {
-    const resolved = PLACEHOLDER_SCENARIO_DEFS.map((def) => ({
-      id: def.id,
-      chipId: def.chipId,
-      text: t(def.textKey),
-    }));
-    return activeChipId
-      ? resolved.filter((scenario) => scenario.chipId === activeChipId)
-      : resolved;
-  }, [activeChipId, t]);
+    return buildPlaceholderScenarios({
+      activeChipId,
+      resolveTextKey: (key) => t(key),
+      examplesForChip: (chipId) => homeHeroChipPromptExamples(chipId, locale),
+      fallbackForChip: (chipId) => fallbackPlaceholderScenarioText(chipId, locale, t),
+    });
+  }, [activeChipId, locale, t]);
   // The placeholder carousel runs while the composer is empty and nothing
   // OTHER than a create-template chip is bound. A selected template keeps it
   // alive (showing that template's scenarios); only an explicit plugin/skill
   // pick — which owns its own placeholder — or a non-empty composer stops it.
-  // Media/live-artifact templates carry no scenarios, so the pool is empty and
-  // the editor falls back to its own placeholder there.
+  // Template types without curated carousel lines fall back to their localized
+  // prompt examples, then to a localized chip-label prompt. That keeps every
+  // create template submittable from an empty composer instead of silently
+  // disabling Send.
   const carouselActive =
     active &&
     !submitting &&
@@ -581,6 +608,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
         mcpOptions,
         pluginOptions,
         connectorOptions,
+        contextWorkspaceItems,
         selectedPluginContexts,
         stagedFiles,
         skillOptions,
@@ -592,6 +620,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
       mcpOptions,
       pluginOptions,
       connectorOptions,
+      contextWorkspaceItems,
       selectedPluginContexts,
       stagedFiles,
       skillOptions,
@@ -895,6 +924,70 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
     onPickConnector(connector, next);
   }
 
+  function insertInlineMentionSeparator() {
+    const current = editorRef.current?.getText() ?? prompt;
+    if (current.trim() && !/\s$/.test(current)) {
+      editorRef.current?.insertText(' ');
+    }
+  }
+
+  function appendWorkspacePrompt(item: WorkspaceContextItem) {
+    onAddWorkspaceContext(item);
+    insertInlineMentionSeparator();
+    editorRef.current?.insertMention({
+      token: inlineMentionToken(item.label),
+      entity: { id: item.id, kind: 'workspace', label: item.label },
+    });
+    onPromptChange(editorRef.current?.getText() ?? prompt);
+    dismissMentionPicker();
+    requestAnimationFrame(() => editorRef.current?.focus());
+  }
+
+  function handleReferenceProjects(selections: ProjectReferenceSelection[]) {
+    for (const selection of selections) {
+      const path = selection.resolvedDir.trim();
+      const label = selection.project.name || selection.project.id;
+      appendWorkspacePrompt(
+        {
+          id: `project:${selection.project.id}`,
+          kind: 'project',
+          label,
+          title: label,
+          path: selection.project.id,
+          ...(path ? { absolutePath: path } : {}),
+        }
+      );
+    }
+    setProjectReferenceOpen(false);
+  }
+
+  async function handleLinkLocalCodeContext() {
+    const selected = await onPickLocalCodeDir?.();
+    if (!selected) return;
+    const label = selected.split(/[/\\]/).filter(Boolean).pop() || selected;
+    appendWorkspacePrompt(
+      {
+        id: `local-code:${selected}`,
+        kind: 'local-code',
+        label,
+        title: label,
+        path: selected,
+        absolutePath: selected,
+      }
+    );
+  }
+
+  function openDesignSystemPicker() {
+    const trigger = homeHeroRef.current?.querySelector<HTMLButtonElement>(
+      '[data-testid="home-hero-design-system-trigger"]',
+    );
+    if (!trigger || trigger.disabled) return;
+    window.requestAnimationFrame(() => {
+      if (trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
+      trigger.focus({ preventScroll: true });
+    });
+  }
+
   // Lexical reports the active @-trigger derived from the caret. HomeHero
   // has no slash surface, so only the mention branch is wired.
   function handleTrigger({
@@ -1061,19 +1154,27 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
     if (activePluginRecord) onOpenPluginDetails(activePluginRecord);
   }
 
-  // plugin/MCP/connector contexts now render as inline @mention pills in the
-  // composer, so they no longer drive this top row — only staged files (which
-  // have no inline representation) and the active plugin/skill/example chips do.
+  function openActiveSkillDetails() {
+    if (activeSkillRecord) onOpenSkillDetails(activeSkillRecord);
+  }
+
+  // Inline-backed plugin/MCP/connector contexts already render as @mention pills
+  // in the editor. This row should mount only for content that has a visible chip
+  // here; the aggregate context count is just an aria label when the row exists.
+  const showActivePluginRow = Boolean(showActivePluginChip && activePluginTitle);
   const showActiveContextRow =
-    contextItemCount > 0 ||
-    (showActivePluginChip && activePluginTitle) ||
-    activeSkillTitle ||
-    stagedFiles.length > 0;
+    stagedFiles.length > 0 ||
+    showActivePluginRow ||
+    Boolean(activeSkillTitle) ||
+    contextOnlyPlugins.length > 0 ||
+    contextOnlyMcpServers.length > 0 ||
+    contextOnlyConnectors.length > 0 ||
+    contextWorkspaceItems.length > 0;
 
   let optionRenderIndex = 0;
 
   return (
-    <section className="home-hero" data-testid="home-hero">
+    <section ref={homeHeroRef} className="home-hero" data-testid="home-hero">
       <div className="home-hero__brand" aria-hidden>
         <span className="home-hero__brand-mark">
           <img src="/app-icon.svg" alt="" draggable={false} />
@@ -1176,7 +1277,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                 })}
               </span>
             ) : null}
-            {showActivePluginChip && activePluginTitle ? (
+            {showActivePluginRow ? (
               <span className="home-hero__active-chip" data-testid="home-hero-active-plugin">
                 <button
                   type="button"
@@ -1225,10 +1326,26 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                 className="home-hero__active-chip home-hero__active-chip--skill"
                 data-testid="home-hero-active-skill"
               >
-                <span className="home-hero__active-icon" aria-hidden>
-                  <Icon name="sparkles" size={12} />
-                </span>
-                <span className="home-hero__active-label">{t('homeHero.skillPrefix', { title: activeSkillTitle })}</span>
+                <button
+                  type="button"
+                  className="home-hero__active-chip-body"
+                  onPointerDown={(event) => {
+                    event.preventDefault();
+                    openActiveSkillDetails();
+                  }}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    openActiveSkillDetails();
+                  }}
+                  onClick={openActiveSkillDetails}
+                  disabled={!activeSkillRecord}
+                  title={activeSkillRecord ? activeSkillRecord.description || activeSkillTitle : undefined}
+                >
+                  <span className="home-hero__active-icon" aria-hidden>
+                    <Icon name="sparkles" size={12} />
+                  </span>
+                  <span className="home-hero__active-label">{t('homeHero.skillPrefix', { title: activeSkillTitle })}</span>
+                </button>
                 <button
                   type="button"
                   className="home-hero__active-clear od-tooltip"
@@ -1242,10 +1359,12 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
               </span>
             ) : null}
             {contextOnlyPlugins.map((plugin) => (
-              <span
+              <ContextChipHoverCard
                 key={`ctx-plugin-${plugin.id}`}
                 className="home-hero__active-chip home-hero__active-chip--context"
                 data-testid={`home-hero-context-plugin-${plugin.id}`}
+                typeLabel="Plugin"
+                detail={plugin.id}
               >
                 <span className="home-hero__active-icon" aria-hidden>
                   <Icon name="sliders" size={12} />
@@ -1262,15 +1381,17 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                 >
                   <Icon name="close" size={9} />
                 </button>
-              </span>
+              </ContextChipHoverCard>
             ))}
             {contextOnlyMcpServers.map((server) => {
               const label = server.label || server.id;
               return (
-                <span
+                <ContextChipHoverCard
                   key={`ctx-mcp-${server.id}`}
                   className="home-hero__active-chip home-hero__active-chip--context"
                   data-testid={`home-hero-context-mcp-${server.id}`}
+                  typeLabel="MCP server"
+                  detail={server.url || server.id}
                 >
                   <span className="home-hero__active-icon" aria-hidden>
                     <Icon name="sliders" size={12} />
@@ -1287,14 +1408,16 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                   >
                     <Icon name="close" size={9} />
                   </button>
-                </span>
+                </ContextChipHoverCard>
               );
             })}
             {contextOnlyConnectors.map((connector) => (
-              <span
+              <ContextChipHoverCard
                 key={`ctx-connector-${connector.id}`}
                 className="home-hero__active-chip home-hero__active-chip--context"
                 data-testid={`home-hero-context-connector-${connector.id}`}
+                typeLabel="Connector"
+                detail={connector.provider || connector.id}
               >
                 <span className="home-hero__active-icon" aria-hidden>
                   <Icon name="link" size={12} />
@@ -1311,7 +1434,36 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                 >
                   <Icon name="close" size={9} />
                 </button>
-              </span>
+              </ContextChipHoverCard>
+            ))}
+            {contextWorkspaceItems.map((item) => (
+              <ContextChipHoverCard
+                key={`ctx-workspace-${item.id}`}
+                className="home-hero__active-chip home-hero__active-chip--context"
+                data-testid={`home-hero-context-workspace-${item.id}`}
+                typeLabel={workspaceContextKindLabel(item.kind)}
+                detail={workspaceContextDetailLine(item)}
+              >
+                <span className="home-hero__active-icon" aria-hidden>
+                  <Icon name={item.kind === 'local-code' ? 'terminal' : 'folder'} size={12} />
+                </span>
+                <span className="home-hero__active-label">{item.label}</span>
+                <button
+                  type="button"
+                  className="home-hero__active-clear od-tooltip"
+                  onClick={() => {
+                    const nextPrompt = stripHomeMentionToken(prompt, item.label);
+                    if (nextPrompt !== prompt) onPromptChange(nextPrompt);
+                    onRemoveWorkspaceContext(item.id);
+                  }}
+                  aria-label={t('chat.removeAria', { name: item.label })}
+                  title={t('common.close')}
+                  data-tooltip={t('common.close')}
+                  data-testid={`home-hero-context-clear-${item.id}`}
+                >
+                  <Icon name="close" size={9} />
+                </button>
+              </ContextChipHoverCard>
             ))}
           </div>
         ) : null}
@@ -1491,6 +1643,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
           <div className="home-hero__foot-left">
             <ComposerPlusMenu
               triggerTestId="home-hero-plus-trigger"
+              placementPreference="down"
               onOpen={() =>
                 trackHomeChatComposerClick(analytics.track, {
                   page_name: 'home',
@@ -1538,6 +1691,17 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                 });
                 onAddPlugin();
               }}
+              skills={skillOptions}
+              onPickSkill={(skill) => {
+                trackHomeChatComposerClick(analytics.track, {
+                  page_name: 'home',
+                  area: 'chat_composer',
+                  element: 'plus_pick',
+                  resource_kind: 'skill',
+                  resource_id: skill.id,
+                });
+                pickSkill(skill);
+              }}
               mcpServers={mcpOptions}
               onPickMcp={(server) => {
                 trackHomeChatComposerClick(analytics.track, {
@@ -1566,6 +1730,22 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                 });
                 fileInputRef.current?.click();
               }}
+              onReferenceProject={() => {
+                trackHomeChatComposerClick(analytics.track, {
+                  page_name: 'home',
+                  area: 'chat_composer',
+                  element: 'plus_pick',
+                });
+                setProjectReferenceOpen(true);
+              }}
+              onLinkLocalCode={onPickLocalCodeDir ? () => {
+                trackHomeChatComposerClick(analytics.track, {
+                  page_name: 'home',
+                  area: 'chat_composer',
+                  element: 'working_dir',
+                });
+                void handleLinkLocalCodeContext();
+              } : undefined}
               onSelectFromLibrary={() => {
                 trackHomeChatComposerClick(analytics.track, {
                   page_name: 'home',
@@ -1582,12 +1762,23 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                 });
                 onImportFigma();
               } : undefined}
+              onShowFigmaHelp={() => setFigmaHelpOpen(true)}
+              onOpenDesignSystems={onDesignSystemChange ? openDesignSystemPicker : undefined}
             />
             {libraryPickerOpen ? (
               <LibraryPicker
                 onClose={() => setLibraryPickerOpen(false)}
                 onConfirm={(assets) => importLibraryAssets(assets)}
               />
+            ) : null}
+            {projectReferenceOpen ? (
+              <ProjectReferenceModal
+                onClose={() => setProjectReferenceOpen(false)}
+                onSelect={handleReferenceProjects}
+              />
+            ) : null}
+            {figmaHelpOpen ? (
+              <FigmaHelpModal onClose={() => setFigmaHelpOpen(false)} />
             ) : null}
             <TemplatePicker
               templates={templateChips}
@@ -1627,6 +1818,12 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
             ) : null}
           </div>
           <div className="home-hero__foot-right">
+            <div className="home-hero__mode-switcher">
+              <SessionModeToggle
+                mode={sessionMode}
+                onChange={onSessionModeChange}
+              />
+            </div>
             {executionSwitcher ? (
               <div className="home-hero__execution-switcher">
                 {executionSwitcher}
@@ -1644,7 +1841,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
               aria-label={submitting ? t('chat.comments.sending') : t('homeHero.run')}
               aria-busy={submitting}
             >
-              <Icon name="send" size={13} />
+              <Icon name="send" size={16} />
               <span>{submitting ? t('chat.comments.sending') : t('chat.send')}</span>
             </button>
           </div>
@@ -1674,7 +1871,7 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
                   area: 'chat_composer',
                   element: 'working_dir',
                 });
-                onPickWorkingDir();
+                void onPickWorkingDir();
               }}
               onSelectRecent={(dir) => {
                 trackHomeChatComposerClick(analytics.track, {
@@ -2083,6 +2280,7 @@ function buildHomeMentionEntities({
   activeSkillId,
   activeSkillTitle,
   connectorOptions,
+  contextWorkspaceItems,
   mcpOptions,
   pluginOptions,
   selectedPluginContexts,
@@ -2093,6 +2291,7 @@ function buildHomeMentionEntities({
   activeSkillId: string | null;
   activeSkillTitle: string | null;
   connectorOptions: ConnectorDetail[];
+  contextWorkspaceItems: WorkspaceContextItem[];
   mcpOptions: McpServerConfig[];
   pluginOptions: InstalledPluginRecord[];
   selectedPluginContexts: InstalledPluginRecord[];
@@ -2100,6 +2299,15 @@ function buildHomeMentionEntities({
   skillOptions: SkillSummary[];
 }): InlineMentionEntity[] {
   const entities: InlineMentionEntity[] = [];
+  for (const item of contextWorkspaceItems) {
+    entities.push({
+      id: item.id,
+      kind: 'workspace',
+      label: item.label,
+      token: inlineMentionToken(item.label),
+      title: `Workspace: ${item.label}`,
+    });
+  }
   const fileSeen = new Set<string>();
   for (const file of stagedFiles) {
     if (fileSeen.has(file.name)) continue;
@@ -3161,6 +3369,26 @@ function homeHeroChipDescription(chipId: string, t: ReturnType<typeof useT>): st
     case 'create-brand-kit': return t('homeHero.chip.createBrandKitDesc');
     default: return '';
   }
+}
+
+function fallbackPlaceholderScenarioText(
+  chipId: string,
+  locale: Locale,
+  t: ReturnType<typeof useT>,
+): string | null {
+  const label = homeHeroChipLabel(chipId, t).trim();
+  if (!label || label === chipId) return null;
+  const description = homeHeroChipDescription(chipId, t).trim();
+  const kind = promptLocaleKind(locale);
+  if (kind === 'zh') {
+    return description ? `创建一个${label}：${description}` : `创建一个${label}`;
+  }
+  if (kind === 'ja') {
+    return description ? `${label}を作成する：${description}` : `${label}を作成する`;
+  }
+  return description
+    ? `Create ${englishArticle(label)} ${label}: ${description}`
+    : `Create ${englishArticle(label)} ${label}`;
 }
 
 // The hover "what happens next" line — describes how the scenario will be
