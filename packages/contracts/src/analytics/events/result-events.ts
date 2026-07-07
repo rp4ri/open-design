@@ -97,6 +97,13 @@ export interface RunCreatedProps {
   // them (e.g. storage unavailable).
   turn_index?: number;
   is_first_run?: boolean;
+  // Per-project run turn index (0-based, project-lifetime per device): "within
+  // THIS project, which prompt / follow-up number is this run?". Complements
+  // the session-wide `turn_index` above (which spans all projects and resets
+  // each browser session) — this one is scoped to a single project and
+  // persists across sessions. Optional: omitted when the client could not
+  // compute it (storage unavailable).
+  project_turn_index?: number;
   // True when the project already had a generated artifact when this run
   // started (project-scoped) — i.e. the run is an edit, not a first creation.
   has_existing_artifact?: boolean;
@@ -663,6 +670,20 @@ export interface PackagedRuntimeFailedProps {
   // The unresolved module when error_code is a module-resolution failure
   // (e.g. `better-sqlite3` for #4638).
   missing_module: string | null;
+  // Crash-scene evidence added for the field-crash subset (#4638 follow-up): the
+  // shipped build is verified-good, so these separate a machine-side "module
+  // missing/unloadable" from a code path, and give the Windows `unknown` bucket
+  // (which has no daemon log to parse) its only signal. All scrubbed of the
+  // user's home dir and truncated before send.
+  //
+  // Free-form error text off the top-level thrown error (not the log tail).
+  error_message?: string | null;
+  error_stack?: string | null;
+  // Probe of the daemon's better-sqlite3 native binding on THIS machine.
+  // present=null when no path was supplied; size is bytes when present.
+  native_module_present?: boolean | null;
+  native_module_size?: number | null;
+  native_module_path?: string | null;
   // Scrubbed of the user's home dir before send.
   log_path: string | null;
   app_version: string | null;
