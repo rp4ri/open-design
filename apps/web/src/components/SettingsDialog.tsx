@@ -390,6 +390,7 @@ interface Props {
    * incremental save, not a final commit.
    */
   onPersist: (cfg: AppConfig, options?: { forceMediaProviderSync?: boolean }) => Promise<void> | void;
+  onDraftChange?: (cfg: AppConfig) => void;
   /**
    * Persist the Composio API key separately from the broader autosave
    * loop. Composio secrets need an explicit user gesture so half-typed
@@ -422,6 +423,15 @@ interface Props {
   onDesignSystemsChanged?: (affectedDesignSystemId?: string) => void;
   onDesignSystemImportRebuildJob?: (designSystemId: string, job: DesignSystemGenerationJob) => void;
   onProviderModelsCacheChange?: Dispatch<SetStateAction<ProviderModelsCache>>;
+}
+
+function telemetryPrefsEqual(
+  a: AppConfig['telemetry'],
+  b: AppConfig['telemetry'],
+): boolean {
+  return a?.metrics === b?.metrics
+    && a?.content === b?.content
+    && a?.artifactManifest === b?.artifactManifest;
 }
 
 export interface AgentRefreshOptions {
@@ -1334,6 +1344,7 @@ export function SettingsDialog({
   onDesignSystemImportRebuildJob,
   providerModelsCache: sharedProviderModelsCache,
   onProviderModelsCacheChange,
+  onDraftChange,
 }: Props) {
   const { t, locale, setLocale } = useI18n();
   const analytics = useAnalytics();
@@ -1356,6 +1367,10 @@ export function SettingsDialog({
     accentColor: resolveAccentColor(initial.accentColor),
   });
 
+  useEffect(() => {
+    onDraftChange?.(cfg);
+  }, [cfg, onDraftChange]);
+
   // settings_view — fire on dialog open and on every section switch so the
   // configuration funnel can see which section the user spent time in.
   // The fire is keyed on section so a section bounce (open → switch →
@@ -1371,12 +1386,17 @@ export function SettingsDialog({
 
   useEffect(() => {
     const previousInitial = previousInitialRef.current;
+    const parentPrivacyChanged =
+      previousInitial.installationId !== initial.installationId ||
+      previousInitial.privacyDecisionAt !== initial.privacyDecisionAt ||
+      !telemetryPrefsEqual(previousInitial.telemetry, initial.telemetry);
     setCfg((current) => {
       const nextAgentCliEnv = reconcileAmrProfileEnv(current.agentCliEnv, initial.agentCliEnv);
       const nextAgentModels = reconcileAmrModelChoice(current.agentModels, previousInitial, initial);
       if (
         nextAgentCliEnv === current.agentCliEnv
         && nextAgentModels === current.agentModels
+        && !parentPrivacyChanged
       ) {
         return current;
       }
@@ -1384,6 +1404,13 @@ export function SettingsDialog({
         ...current,
         agentCliEnv: nextAgentCliEnv,
         agentModels: nextAgentModels,
+        ...(parentPrivacyChanged
+          ? {
+              installationId: initial.installationId,
+              privacyDecisionAt: initial.privacyDecisionAt,
+              telemetry: initial.telemetry ? { ...initial.telemetry } : undefined,
+            }
+          : {}),
       };
     });
     autosaveLastSavedRef.current = {
@@ -1397,6 +1424,13 @@ export function SettingsDialog({
         previousInitial,
         initial,
       ),
+      ...(parentPrivacyChanged
+        ? {
+            installationId: initial.installationId,
+            privacyDecisionAt: initial.privacyDecisionAt,
+            telemetry: initial.telemetry ? { ...initial.telemetry } : undefined,
+          }
+        : {}),
     };
     previousInitialRef.current = initial;
   }, [initial]);
@@ -5173,7 +5207,7 @@ export function SettingsDialog({
                 model={cfg.model}
                 modelSelectRef={modelSelectRef}
                 models={apiModelOptions.map((m) => ({
-                  id: m.id,
+                  ...m,
                   label: apiModelOptionLabel(
                     m,
                     !hidesAccountModelSourceLabel(apiProtocol) &&
@@ -5608,6 +5642,24 @@ export function SettingsDialog({
               ) : (
                 <div className="empty-card">{t('settings.versionUnavailable')}</div>
               )}
+              <div className="settings-about-diagnostics settings-about-silent-updates">
+                <label className="settings-about-toggle">
+                  <input
+                    checked={cfg.allowSilentUpdates === true}
+                    type="checkbox"
+                    onChange={(event) =>
+                      setCfg((current) => ({
+                        ...current,
+                        allowSilentUpdates: event.currentTarget.checked,
+                      }))
+                    }
+                  />
+                  <span className="settings-about-toggle-copy">
+                    <span>{t('settings.allowSilentUpdates')}</span>
+                    <span className="hint">{t('settings.allowSilentUpdatesDesc')}</span>
+                  </span>
+                </label>
+              </div>
               <div className="settings-about-diagnostics">
                 <div className="settings-about-diagnostics-text">
                   <h4>{t('diagnostics.exportTitle')}</h4>

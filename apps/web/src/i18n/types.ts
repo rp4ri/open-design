@@ -251,6 +251,21 @@ export interface Dict {
   'settings.onboardingOrgSizeLabel': string;
   'settings.onboardingUseCaseLabel': string;
   'settings.onboardingSourceLabel': string;
+  'settings.onboardingSourceX': string;
+  'settings.onboardingSourceGithub': string;
+  'settings.onboardingSourceYoutube': string;
+  'settings.onboardingSourceTiktok': string;
+  'settings.onboardingSourceReddit': string;
+  'settings.onboardingSourceLinkedin': string;
+  'settings.onboardingSourceMetaSocial': string;
+  'settings.onboardingSourceSearch': string;
+  'settings.onboardingSourceAiTool': string;
+  'settings.onboardingSourceFriend': string;
+  'settings.onboardingSourceCommunity': string;
+  'settings.onboardingSourceEmail': string;
+  'settings.onboardingSourceBlog': string;
+  'settings.onboardingSourceOther': string;
+  'settings.onboardingSourceOtherPlaceholder': string;
   'settings.onboardingSelectPlaceholder': string;
   'settings.onboardingSelectMultiplePlaceholder': string;
   'settings.onboardingOrgSolo': string;
@@ -279,16 +294,6 @@ export interface Dict {
   'settings.onboardingUseDeck': string;
   'settings.onboardingUseEngineering': string;
   'settings.onboardingUseAgency': string;
-  'settings.onboardingSourceGithub': string;
-  'settings.onboardingSourceFriend': string;
-  'settings.onboardingSourceSocial': string;
-  'settings.onboardingSourceProductHunt': string;
-  'settings.onboardingSourceCommunity': string;
-  'settings.onboardingSourceYoutube': string;
-  'settings.onboardingSourceBlog': string;
-  'settings.onboardingSourceAiTool': string;
-  'settings.onboardingSourceSearch': string;
-  'settings.onboardingSourceEvent': string;
   'settings.onboardingBack': string;
   'settings.onboardingContinue': string;
   'settings.onboardingFinish': string;
@@ -401,18 +406,12 @@ export interface Dict {
   'settings.modelsLoadedCount': string;
   'settings.modelSourceAccount': string;
   'settings.modelSourceSuggested': string;
-  'modelCapability.fast': string;
-  'modelCapability.value': string;
-  'modelCapability.balanced': string;
-  'modelCapability.reasoning': string;
-  'modelCapability.premium': string;
-  'modelCapability.coding': string;
-  'modelCapability.fastDescription': string;
-  'modelCapability.valueDescription': string;
-  'modelCapability.balancedDescription': string;
-  'modelCapability.reasoningDescription': string;
-  'modelCapability.premiumDescription': string;
-  'modelCapability.codingDescription': string;
+  'modelCapability.standard': string;
+  'modelCapability.advanced': string;
+  'modelCapability.bestQuality': string;
+  'modelCapability.standardDescription': string;
+  'modelCapability.advancedDescription': string;
+  'modelCapability.bestQualityDescription': string;
   'modelCost.upToHalf': string;
   'modelCost.halfToOne': string;
   'modelCost.oneToFour': string;
@@ -530,6 +529,8 @@ export interface Dict {
   'settings.runtimePackaged': string;
   'settings.runtimeDevelopment': string;
   'settings.versionUnavailable': string;
+  'settings.allowSilentUpdates': string;
+  'settings.allowSilentUpdatesDesc': string;
   'settings.installLatest': string;
   'settings.alreadyLatest': string;
   'settings.updateCheck': string;
@@ -949,6 +950,7 @@ export interface Dict {
   'updater.installerOpenBody': string;
   'updater.installerOpened': string;
   'updater.later': string;
+  'updater.allowSilentUpdates': string;
   'updater.openFailedFallback': string;
   'updater.installRestart': string;
   'updater.installingRestart': string;
@@ -964,6 +966,12 @@ export interface Dict {
   'updater.readyGeneric': string;
   'updater.readyVersion': string;
   'updater.upToDate': string;
+
+  // Post-update "what's new" card on the home surface. Release-configured
+  // copy comes from the release feed; these keys cover the card chrome and
+  // the generic fallback when a version ships without highlights.
+  'whatsNew.cta': string;
+  'whatsNew.dismissAria': string;
 
   // Newsletter email field on the onboarding About-you step.
   'newsletter.label': string;
@@ -1080,10 +1088,12 @@ export interface Dict {
   'homeHero.moreShortcuts': string;
   'homeHero.railAria': string;
   'homeHero.subTypeAria': string;
+  'homeHero.subTypeMore': string;
   'homeHero.confirmReplaceTitle': string;
   'homeHero.confirmReplaceBody': string;
   'homeHero.confirmReplace': string;
   'homeHero.chip.prototype': string;
+  'homeHero.chip.webClone': string;
   'homeHero.chip.liveArtifact': string;
   'homeHero.chip.deck': string;
   'homeHero.chip.image': string;
@@ -1106,6 +1116,7 @@ export interface Dict {
   'homeHero.chip.mobile': string;
   'homeHero.chip.document': string;
   'homeHero.chip.prototypeDesc': string;
+  'homeHero.chip.webCloneDesc': string;
   'homeHero.chip.wireframeDesc': string;
   'homeHero.chip.mobileDesc': string;
   'homeHero.chip.deckDesc': string;
@@ -1121,6 +1132,7 @@ export interface Dict {
   'homeHero.chip.liveArtifactDesc': string;
   'homeHero.chip.createBrandKitDesc': string;
   'homeHero.chip.prototypeNext': string;
+  'homeHero.chip.webCloneNext': string;
   'homeHero.chip.wireframeNext': string;
   'homeHero.chip.mobileNext': string;
   'homeHero.chip.deckNext': string;
@@ -1128,6 +1140,7 @@ export interface Dict {
   'homeHero.chip.imageNext': string;
   'homeHero.chip.videoNext': string;
   'homeHero.chip.audioNext': string;
+  'homeHero.chip.webClonePromptSeed': string;
   'homeWorkingDir.trigger': string;
   'homeWorkingDir.pick': string;
   'homeWorkingDir.replace': string;
@@ -1275,6 +1288,21 @@ export interface Dict {
   'pluginsHome.subfacet.marketing-product': string;
   'pluginsHome.subfacet.data-explainers': string;
   'pluginsHome.subfacet.cinematic-story': string;
+  'pluginsHome.commercialCategory.student-coursework': string;
+  'pluginsHome.commercialCategory.corporate-strategy': string;
+  'pluginsHome.commercialCategory.professional-training': string;
+  'pluginsHome.commercialCategory.b2b-sales': string;
+  'pluginsHome.commercialCategory.academic-research': string;
+  'pluginsHome.commercialCategory.marketing-gtm': string;
+  'pluginsHome.commercialCategory.data-finance': string;
+  'pluginsHome.commercialCategory.fundraising-pitch': string;
+  'pluginsHome.commercialCategory.government-policy': string;
+  'pluginsHome.commercialCategory.product-management': string;
+  'pluginsHome.commercialCategory.consulting': string;
+  'pluginsHome.commercialCategory.career': string;
+  'pluginsHome.commercialCategory.ai-literacy': string;
+  'pluginsHome.commercialCategory.life': string;
+  'pluginsHome.commercialCategory.design-craft': string;
   'pluginsView.lede': string;
   'pluginsView.importPlugin': string;
   'pluginsView.agentContext': string;
@@ -2454,6 +2482,7 @@ export interface Dict {
   'chat.runError.title.toolLoop': string;
   'chat.runError.title.outputInvalid': string;
   'chat.runError.title.runtimeConfig': string;
+  'chat.runError.title.quotaExhausted': string;
   'chat.runError.title.generic': string;
   'chat.runError.signInMessage.amr': string;
   'chat.runError.signInMessage.other': string;
@@ -2465,6 +2494,8 @@ export interface Dict {
   'chat.runError.toolLoopMessage': string;
   'chat.runError.outputInvalidMessage': string;
   'chat.runError.runtimeConfigMessage': string;
+  'chat.runError.quotaExhaustedMessage': string;
+  'chat.runError.workspaceCreditsMessage': string;
   'chat.runError.agentFallback': string;
   'chat.runError.sourceLabel': string;
   'chat.runError.sourceExpandAria': string;
@@ -3396,6 +3427,8 @@ export interface Dict {
   'fileViewer.mark': string;
   'fileViewer.markTool': string;
   'fileViewer.boxSelect': string;
+  'fileViewer.textTool': string;
+  'fileViewer.textAnnotationRemove': string;
   'fileViewer.screenshot': string;
   'fileViewer.versions.entry': string;
   'fileViewer.versions.title': string;
@@ -3495,6 +3528,16 @@ export interface Dict {
   'fileViewer.previousSlide': string;
   'fileViewer.nextSlide': string;
   'fileViewer.slideNavAria': string;
+  'fileViewer.speakerNotes': string;
+  'fileViewer.speakerNotesSlide': string;
+  'fileViewer.speakerNotesEmpty': string;
+  'fileViewer.speakerNotesEdit': string;
+  'fileViewer.speakerNotesSave': string;
+  'fileViewer.speakerNotesSaving': string;
+  'fileViewer.speakerNotesSaved': string;
+  'fileViewer.speakerNotesSaveFailed': string;
+  'fileViewer.speakerNotesPlaceholder': string;
+  'fileViewer.presenterReset': string;
   'fileViewer.present': string;
   'fileViewer.presentInTab': string;
   'fileViewer.presentFullscreen': string;
@@ -3864,6 +3907,7 @@ export interface Dict {
   'questions.generating': string;
   'questions.skipAll': string;
   'questions.autoSkipHint': string;
+  'questions.submitting': string;
 
   // Inline <od-card> memory cards (display-only siblings of question-form)
   'artifact.odCardTaskBriefChip': string;
@@ -4247,4 +4291,28 @@ export interface Dict {
   'brandPicker.extractAction': string;
   'brandPicker.showMore': string;
   'brandPicker.opening': string;
+  'newproj.startFromLabel': string;
+  'newproj.startBlank': string;
+  'newproj.startBlankHint': string;
+  'workspace.pages': string;
+  'workspace.allProjectFiles': string;
+  'workspace.newBlankPage': string;
+  'workspace.noPagesYet': string;
+  'workspace.pageCreateFailed': string;
+  'workspace.pageCreatorTitle': string;
+  'workspace.pageCreatorSearch': string;
+  'workspace.pageCreatorCategoryAll': string;
+  'workspace.pageCreatorEmpty': string;
+  'workspace.pageCreatorPreview': string;
+  'workspace.pageCreatorUse': string;
+  'fileViewer.presentInTabDeckHint': string;
+  'fileViewer.presentEscHint': string;
+  'fileViewer.presenterPause': string;
+  'fileViewer.presenterResume': string;
+  'fileViewer.presenterPrevious': string;
+  'fileViewer.presenterNext': string;
+  'questions.uploadingFiles': string;
+  'questions.uploadNeedsProject': string;
+  'questions.uploadPartialFailed': string;
+  'questions.uploadFailed': string;
 }
