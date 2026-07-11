@@ -210,7 +210,7 @@ import {
   fetchVelaPresetModels,
   fetchVelaRemoteModelsWithRetry,
 } from './runtimes/defs/amr.js';
-import { migrateLegacyDataDirSync } from './legacy-data-migrator.js';
+import { migrateLegacyDataDirSync } from './migration/index.js';
 import {
   consumedImportNonces,
   getDesktopAuthSecret,
@@ -369,6 +369,7 @@ import { classifyRunFailure, isResumableFailure } from './run-failure-classifica
 import { decideSafeRunRetry } from './run-retry-policy.js';
 import {
   amrUserIdForRunAnalytics,
+  scanRunEventsForUsageAnalytics,
 } from './run-analytics-observability.js';
 import {
   createRunArtifactBaselines,
@@ -395,14 +396,14 @@ import {
   validateBaseUrlResolved,
 } from './connectionTest.js';
 import { listProviderModels } from './integrations/provider-models.js';
-import { importClaudeDesignZip } from './claude-design-import.js';
+import { importClaudeDesignZip } from './design/index.js';
 import {
   defaultBaseUrlForFinalizeProtocol,
   finalizeDesignPackage,
   FinalizePackageLockedError,
   FinalizeUpstreamError,
   isFinalizeProviderProtocol,
-} from './finalize-design.js';
+} from './design/index.js';
 import { buildDocumentPreview } from './document-preview.js';
 import { lintArtifact, renderFindingsForAgent } from './lint-artifact.js';
 import { loadCraftSections } from './craft.js';
@@ -594,7 +595,7 @@ import { registerProjectRoutes, registerProjectArtifactRoutes, registerProjectFi
 import { registerVelaRoutes } from './routes/vela.js';
 import { registerFinalizeRoutes, registerImportRoutes, registerProjectExportRoutes } from './import-export-routes.js';
 import { registerHandoffRoutes } from './routes/handoff.js';
-import { EmptyTranscriptError, synthesizeHandoffPrompt } from './handoff-design.js';
+import { EmptyTranscriptError, synthesizeHandoffPrompt } from './design/index.js';
 import { TranscriptExportLockedError } from './transcript-export.js';
 import { registerChatRoutes } from './routes/chat.js';
 import { registerRunRoutes } from './routes/runs.js';
@@ -6864,6 +6865,28 @@ export async function startServer({
         noteCliReadyAt();
         if (ev?.type === 'error') {
           if (agentStreamError) return;
+          // Hold back a resume-failure error so the close handler's transparent
+          // reseed stays invisible. An is_error result frame on a dead --resume
+          // now surfaces here as a stream error; the resume-target-missing
+          // block in the close handler clears the stale handle and re-runs the
+          // turn fresh, so forwarding this error would flash an execution
+          // failure a beat before the invisible recovery. Mirrors the ACP
+          // resume_failed suppression below; the close handler stays the sole
+          // authority on how a resume failure ends.
+          if (
+            (def.resumesSessionViaCli === true || def.resumesSessionViaAcpLoad === true) &&
+            agentResumeCtx.isResuming &&
+            !run.resumeAutoReseeded &&
+            isAgentResumeFailure(def.id, agentStderrTail, agentStdoutTail)
+          ) {
+            design.runs.emit(run, 'diagnostic', {
+              type: 'agent_resume_failed_suppressed',
+              agent_id: def.id,
+              reason: 'resume_failed',
+              previous_session_id: agentResumeCtx.resumeSessionId ?? null,
+            });
+            return;
+          }
           flushVisibleAgentStderr();
           const message = String((ev as any).message || 'Claude Code stream error');
           const failureText = [
