@@ -1414,6 +1414,9 @@ describe('FileWorkspace launcher tab creation', () => {
 
     fireEvent.click(screen.getByTestId('emit-browser-snapshot-success'));
     await screen.findByRole('button', { name: 'View Design Files' });
+    const toastAnchor = document.querySelector('.workspace-toast-anchor');
+    expect(toastAnchor).toBeTruthy();
+    expect(toastAnchor?.querySelector('.od-toast-browser-snapshot')).toBeTruthy();
     const toastAction = document.querySelector<HTMLButtonElement>('.od-toast-action');
     if (!toastAction) throw new Error('Could not find browser snapshot toast action');
     await act(async () => {

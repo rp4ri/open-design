@@ -237,6 +237,7 @@ import { useIframeKeepAlivePool } from './IframeKeepAlivePool';
 import {
   decideAutoOpenAfterWrite,
   selectAutoOpenProducedArtifact,
+  selectAutoOpenTurnArtifact,
 } from './auto-open-file';
 import { buildRepoImportPrompt, designSystemNeedsRepoConnect } from './design-system-github-evidence';
 import { isDesignSystemProject, resolveProjectDesignSystemId } from './design-system-project';
@@ -3142,13 +3143,6 @@ export function ProjectView({
         nonce,
         attentionAction: 'download-page',
       });
-      setProjectActionsToast({
-        message: t('chat.brandBrowserAssistDownloadGuideTitle'),
-        details: t('chat.brandBrowserAssistDownloadGuideDetails'),
-        tone: 'default',
-        ttlMs: 12000,
-        scope: 'chat-pane',
-      });
       return { ok: true, action: 'opened' };
     },
     [currentProject.metadata?.brandSourceUrl, t],
@@ -3916,15 +3910,21 @@ export function ProjectView({
             }
             const diff = computeProducedFiles(beforeFileNames, nextFiles) ?? [];
             const produced = mergeRecoveredArtifact(diff, recoveredExistingArtifact);
+            const touchedFilePaths = extractTouchedFilePathsFromEvents(message.events);
             const traceObjectFiles = mergeRecoveredTraceObjectFile(
               computeTraceObjectFiles(
                 beforeFileNames,
                 nextFiles,
-                extractTouchedFilePathsFromEvents(message.events),
+                touchedFilePaths,
               ) ?? [],
               recoveredExistingArtifact,
             );
-            const producedArtifactToOpen = selectAutoOpenProducedArtifact(produced, autoOpenArtifactOptions);
+            const producedArtifactToOpen = selectAutoOpenTurnArtifact(produced, nextFiles, {
+              ...autoOpenArtifactOptions,
+              turnStartedAt: status.createdAt || message.startedAt || message.createdAt || null,
+              turnEndedAt: message.endedAt || legacyReplayEndedAt || null,
+              agentTouchedFileNames: resolveAgentTouchedFileNames(touchedFilePaths, nextFiles),
+            });
             if (producedArtifactToOpen) requestOpenFile(producedArtifactToOpen);
             const deliveryOutcome = resolveDesignDeliveryOutcome({
               sessionMode: message.sessionMode,
@@ -4225,17 +4225,23 @@ export function ProjectView({
                 }
                 const diff = computeProducedFiles(beforeFileNames, nextFiles) ?? [];
                 const produced = mergeRecoveredArtifact(diff, recoveredExistingArtifact);
+                const touchedFilePaths = extractTouchedFilePathsFromEvents(
+                  needsFullReplay ? replayedEvents : message.events,
+                );
                 const traceObjectFiles = mergeRecoveredTraceObjectFile(
                   computeTraceObjectFiles(
                     beforeFileNames,
                     nextFiles,
-                    extractTouchedFilePathsFromEvents(
-                      needsFullReplay ? replayedEvents : message.events,
-                    ),
+                    touchedFilePaths,
                   ) ?? [],
                   recoveredExistingArtifact,
                 );
-                const producedArtifactToOpen = selectAutoOpenProducedArtifact(produced, autoOpenArtifactOptions);
+                const producedArtifactToOpen = selectAutoOpenTurnArtifact(produced, nextFiles, {
+                  ...autoOpenArtifactOptions,
+                  turnStartedAt: status.createdAt || message.startedAt || message.createdAt || null,
+                  turnEndedAt: endedAt ?? null,
+                  agentTouchedFileNames: resolveAgentTouchedFileNames(touchedFilePaths, nextFiles),
+                });
                 if (producedArtifactToOpen) requestOpenFile(producedArtifactToOpen);
                 const deliveryContent = needsFullReplay ? replayedContent : message.content;
                 const deliveryEvents = needsFullReplay ? replayedEvents : message.events;
@@ -5662,7 +5668,12 @@ export function ProjectView({
                 nextFiles,
                 traceTouchedFilePaths,
               ) ?? [];
-              const producedArtifactToOpen = selectAutoOpenProducedArtifact(produced, autoOpenArtifactOptions);
+              const producedArtifactToOpen = selectAutoOpenTurnArtifact(produced, nextFiles, {
+                ...autoOpenArtifactOptions,
+                turnStartedAt: startedAt,
+                turnEndedAt: endedAt ?? null,
+                agentTouchedFileNames: resolveAgentTouchedFileNames(traceTouchedFilePaths, nextFiles),
+              });
               if (producedArtifactToOpen) requestOpenFile(producedArtifactToOpen);
               const deliveryCandidate: ChatMessage = {
                 ...latestAssistantMsg,
@@ -8119,7 +8130,7 @@ export function ProjectView({
           snapshotMessage(liveSnapshot) ||
           fallbackMessage ||
           t('chat.brandBrowserAssistReadFailed'),
-        details: t('chat.brandBrowserAssistDownloadGuideDetails'),
+        details: null,
         tone: 'error',
         ttlMs: 7000,
         scope: 'chat-pane',
@@ -8659,6 +8670,7 @@ export function ProjectView({
               hasActiveDesignSystem={!!projectDesignSystemId}
               activeDesignSystem={chatDesignSystemSummary}
               projectFileNames={projectFileNames}
+              projectResolvedDir={projectDetail.resolvedDir}
               skills={skills}
               onEnsureProject={handleEnsureProject}
               previewComments={previewComments}
@@ -9780,6 +9792,23 @@ function normalizeComparableFilePath(value: string): string {
     .split('/')
     .filter((part) => part && part !== '.')
     .join('/');
+}
+
+// Resolve the agent's raw Write/Edit tool paths (absolute or partial) to
+// project file NAMES for selectAutoOpenTurnArtifact's touched-file
+// restriction. Paths that do not resolve to a project file (out-of-project
+// writes) are dropped; ambiguous matches resolve to null inside
+// findTouchedProjectFile and are dropped the same way.
+export function resolveAgentTouchedFileNames(
+  touchedPaths: Iterable<string>,
+  files: readonly ProjectFile[],
+): Set<string> {
+  const names = new Set<string>();
+  for (const rawPath of touchedPaths) {
+    const file = findTouchedProjectFile(rawPath, files);
+    if (file) names.add(file.name);
+  }
+  return names;
 }
 
 // Reattach with a recovered (on-disk) artifact must still include any
