@@ -2481,6 +2481,40 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     expect(optionNames(modelPopover)).toEqual(['gpt-4.1-mini', 'gpt-5.5', 'Custom (type below)…']);
   });
 
+  it('keeps the Local CLI custom model input clearable when default is the fallback model', () => {
+    renderSettingsDialog(
+      { mode: 'daemon', agentId: 'codex' },
+      {
+        agents: [
+          {
+            ...availableAgents[0]!,
+            models: [{ id: 'default', label: 'Default' }],
+          },
+        ],
+      },
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: /Local CLI/i }));
+    fireEvent.click(screen.getByRole('combobox', {
+      name: en['settings.modelPicker'],
+    }));
+    const modelPopover = screen.getByTestId('settings-agent-model-popover-codex');
+    fireEvent.click(within(modelPopover).getByRole('option', {
+      name: en['settings.modelCustom'],
+    }));
+
+    const customModelInput = screen.getByLabelText(
+      en['settings.modelCustomLabel'],
+    ) as HTMLInputElement;
+    expect(customModelInput.value).toBe('');
+
+    fireEvent.change(customModelInput, { target: { value: 'default' } });
+    expect(customModelInput.value).toBe('default');
+
+    fireEvent.change(customModelInput, { target: { value: '' } });
+    expect(customModelInput.value).toBe('');
+  });
+
   it('labels live CLI model metadata in the model picker', () => {
     renderSettingsDialog(
       { mode: 'daemon', agentId: 'codex' },

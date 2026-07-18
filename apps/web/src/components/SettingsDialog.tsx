@@ -3596,9 +3596,14 @@ export function SettingsDialog({
     // (AMR routes through ACP `session/set_model` and validates against
     // a live catalog). Undefined === allow, matching today's UX.
     const allowCustomModel = selected.supportsCustomModel !== false;
+    const explicitCustomMode = agentCustomModelIds.has(selected.id);
     const configuredModel =
       typeof effectiveChoice.model === 'string' && effectiveChoice.model
         ? effectiveChoice.model
+        : null;
+    const customModelDraft =
+      explicitCustomMode && typeof choice.model === 'string'
+        ? choice.model
         : null;
     const setChoice = (
       next: { model?: string; reasoning?: string },
@@ -3614,12 +3619,13 @@ export function SettingsDialog({
         };
       });
     };
-    const modelValue =
+    const fallbackModelValue =
       selected.id === 'amr' &&
       configuredModel &&
       !knownModelIds.includes(configuredModel)
         ? defaultAgentModelId(selected) ?? ''
         : configuredModel ?? defaultAgentModelId(selected) ?? '';
+    const modelValue = customModelDraft ?? fallbackModelValue;
     const reasoningValue =
       effectiveChoice.reasoning ??
       choice.reasoning ??
@@ -3630,7 +3636,7 @@ export function SettingsDialog({
       shouldShowCustomModelInput(
         modelValue,
         knownModelIds,
-        agentCustomModelIds.has(selected.id),
+        explicitCustomMode,
       );
     const selectValue = customActive
       ? CUSTOM_MODEL_SENTINEL
@@ -7424,7 +7430,7 @@ function MediaProvidersSection({
 //
 // Schemas drift between clients in deliberate ways. VS Code keys
 // servers under "servers" with a required "type" field; Zed uses
-// "context_servers"; Cursor, Windsurf, and Antigravity share
+// "context_servers"; Cursor, Kiro, Windsurf, and Antigravity share
 // "mcpServers"; Claude Code is best served by its CLI which writes
 // to the local config for you. Verified against each tool's official
 // docs in May 2026.
@@ -7439,6 +7445,7 @@ type McpClientId =
   | 'claude'
   | 'codex'
   | 'cursor'
+  | 'kiro'
   | 'vscode'
   | 'zed'
   | 'windsurf'
@@ -7701,6 +7708,17 @@ function IntegrationsSection() {
         return `cursor://anysphere.cursor-deeplink/mcp/install?name=open-design&config=${encoded}`;
       },
       deeplinkLabel: () => t('settings.mcpDeeplinkInstallCursor'),
+    },
+    {
+      id: 'kiro',
+      label: 'Kiro CLI',
+      buildMethod: () => t('settings.mcpMethodJson'),
+      buildInstruction: (info) =>
+        t('settings.mcpInstructionKiro', {
+          path: homeConfigPath(info.platform, '~/.kiro/settings/mcp.json', '%USERPROFILE%\\.kiro\\settings\\mcp.json'),
+        }),
+      buildSnippet: buildSharedMcpJson,
+      buildSnippetLang: () => 'json',
     },
     {
       id: 'vscode',

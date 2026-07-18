@@ -2647,13 +2647,21 @@ function fileVersionSourceToTracking(version: ProjectFileVersion): TrackingFileV
   return 'ai';
 }
 
+function sourceLooksLikeDeckPreview(source: string | null | undefined): boolean {
+  if (!source) return false;
+  return (
+    /class\s*=\s*['"](?:[^'"]*\s)?slide(?:\s|['"])/i.test(source) ||
+    sourceLooksLikeExportableDeck(source)
+  );
+}
+
 export function fileVersionPreviewOptions(
   projectId: string,
   fileName: string,
   source: string | null | undefined,
 ) {
   return {
-    deck: sourceLooksLikeExportableDeck(source),
+    deck: sourceLooksLikeDeckPreview(source),
     baseHref: projectRawUrl(projectId, baseDirFor(fileName)),
   };
 }
@@ -2696,6 +2704,12 @@ export function deckKeyboardShortcutForEvent(event: DeckKeyboardShortcutEvent): 
   if (event.key === 'End') return 'last';
   if (event.key.toLowerCase() === 'r') return 'reset';
   return null;
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
 }
 
 function normalizeDeckVisualSource(source: string): string {
@@ -2996,6 +3010,25 @@ function FileVersionManagerModal({
     const fallback = window.setTimeout(() => setLoadedSrcDoc(srcDoc), 6000);
     return () => window.clearTimeout(fallback);
   }, [srcDoc, loadedSrcDoc]);
+
+  useEffect(() => {
+    if (!isDeckPreview || !selectedContentMatchesVersion || loadingContent) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (document.activeElement === versionPreviewIframeRef.current) return;
+      if (isEditableKeyboardTarget(event.target) || isEditableKeyboardTarget(document.activeElement)) return;
+      const shortcut = deckKeyboardShortcutForEvent(event);
+      if (!shortcut) return;
+      const win = versionPreviewIframeRef.current?.contentWindow;
+      if (!win) return;
+      event.preventDefault();
+      win.postMessage({
+        type: 'od:slide',
+        action: shortcut === 'reset' ? 'first' : shortcut,
+      }, '*');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isDeckPreview, loadingContent, selectedContentMatchesVersion]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -7027,11 +7060,7 @@ function HtmlViewer({
   // never surface and the deck becomes a static, unnavigable preview.
   const looksLikeDeck = useMemo(() => {
     const s = routingHtmlSource;
-    if (!s) return false;
-    return (
-      /class\s*=\s*['"](?:[^'"]*\s)?slide(?:\s|['"])/i.test(s) ||
-      sourceLooksLikeExportableDeck(s)
-    );
+    return sourceLooksLikeDeckPreview(s);
   }, [routingHtmlSource]);
   const effectiveDeck = isDeck || (!passiveLargeHtmlPreview && looksLikeDeck);
   const showDeckNavigation = effectiveDeck && (slideState === null || slideState.count > 0);
