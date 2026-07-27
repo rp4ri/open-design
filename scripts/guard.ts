@@ -3,8 +3,11 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import ts from "typescript";
 
+import { checkCertainExemptConsumption } from "./check-certain-exempt-consumption.ts";
 import { checkCrossAppImports } from "./check-cross-app-imports.ts";
+import { checkPackagedLeafBoundary } from "./check-packaged-leaf-boundary.ts";
 import { checkTsNocheckImports } from "./check-ts-nocheck-imports.ts";
+import { checkUiP0ShadowContract } from "./check-ui-p0-shadow.ts";
 import { checkDesignSystemManifests } from "./check-design-system-manifests.ts";
 import { checkDesignSystemPackageQuality } from "./check-design-system-package-quality.ts";
 import { checkDesignSystemComponentFixtureReport } from "./check-components-fixtures.ts";
@@ -52,6 +55,8 @@ const residualSkippedDirectories = new Set([
   ".od",
   ".od-e2e",
   ".opencode",
+  // Local agent deepwork/worktree scratch (git-ignored; not product source).
+  ".slim",
   ".task",
   ".tmp",
   ".vite",
@@ -1322,6 +1327,9 @@ async function checkCiTopology(): Promise<boolean> {
 
 const checks: GuardCheck[] = [
   { name: "residual JavaScript", run: checkResidualJavaScript },
+  { name: "certain-exempt surface consumption", run: checkCertainExemptConsumption },
+  { name: "packaged leaf boundary", run: checkPackagedLeafBoundary },
+  { name: "UI P0 shadow contract", run: checkUiP0ShadowContract },
   { name: "package dependency specs", run: checkPackageDependencySpecs },
   { name: "product neutrality", run: checkProductNeutrality },
   { name: "cross-app imports", run: checkCrossAppImports },
@@ -1365,6 +1373,13 @@ async function runChecks(): Promise<boolean> {
 }
 
 const isMain = process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false;
-if (isMain && !(await runChecks())) {
-  process.exitCode = 1;
+if (isMain) {
+  // `--list-checks` is the machine-readable registry of guard check names; the
+  // scope rule-table invariant test resolves `certain` rules' guard fields
+  // against it so a renamed or deleted guard fails CI.
+  if (process.argv[2] === "--list-checks") {
+    for (const check of checks) console.log(check.name);
+  } else if (!(await runChecks())) {
+    process.exitCode = 1;
+  }
 }
