@@ -41,6 +41,10 @@ import {
   resetProjectDisplaySnapshots,
   writeProjectDisplaySnapshot,
 } from '../../src/state/project-display-cache';
+import {
+  designBrowserHistoryStorageKey,
+  designBrowserViewportStorageKey,
+} from '../../src/components/design-browser-storage';
 
 function personalWorkspaceContext(): WorkspaceCollabContext {
   return {
@@ -1714,15 +1718,21 @@ describe('moveWorkspaceProject error surfaces (recvqzjnshIlOe)', () => {
   });
 });
 
-describe('deleteProject tabs cache', () => {
+describe('deleteProject local caches', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
   const tabsKey = 'open-design:project-tabs:v1:p1';
+  const historyKey = designBrowserHistoryStorageKey('p1');
+  const viewportKey = designBrowserViewportStorageKey('p1');
 
   function stubWindowStore(): Map<string, string> {
-    const store = new Map<string, string>([[tabsKey, JSON.stringify({ tabs: [], active: null })]]);
+    const store = new Map<string, string>([
+      [tabsKey, JSON.stringify({ tabs: [], active: null })],
+      [historyKey, JSON.stringify([{ url: 'https://example.com', title: 'Example', lastVisitedAt: 1 }])],
+      [viewportKey, 'mobile'],
+    ]);
     vi.stubGlobal('window', {
       localStorage: {
         getItem: (k: string) => store.get(k) ?? null,
@@ -1737,18 +1747,22 @@ describe('deleteProject tabs cache', () => {
     return store;
   }
 
-  it('prunes the project tabs cache on a successful delete', async () => {
+  it('prunes tabs and Design Browser caches on a successful delete', async () => {
     const store = stubWindowStore();
     vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => new Response(null, { status: 200 })));
     await expect(deleteProject('p1')).resolves.toBe(true);
     expect(store.has(tabsKey)).toBe(false);
+    expect(store.has(historyKey)).toBe(false);
+    expect(store.has(viewportKey)).toBe(false);
   });
 
-  it('keeps the tabs cache when the delete fails', async () => {
+  it('keeps tabs and Design Browser caches when the delete fails', async () => {
     const store = stubWindowStore();
     vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => new Response(null, { status: 500 })));
     await expect(deleteProject('p1')).resolves.toBe(false);
     expect(store.has(tabsKey)).toBe(true);
+    expect(store.has(historyKey)).toBe(true);
+    expect(store.has(viewportKey)).toBe(true);
   });
 });
 

@@ -47,6 +47,7 @@ import type {
   ProjectMetadata,
   ProjectTemplate,
 } from '../types';
+import { removeDesignBrowserProjectCache } from '../components/design-browser-storage';
 
 export type { PluginInstallOutcome } from '@open-design/contracts';
 export type { PluginShareAction } from '@open-design/contracts';
@@ -820,10 +821,12 @@ export async function deleteProject(
       method: 'DELETE',
       ...(workspaceContext ? { headers: workspaceProjectHeaders(workspaceContext) } : {}),
     });
-    // Drop the project's local tab-state cache once it is gone server-side, so
-    // the `open-design:project-tabs:*` keys don't accumulate in localStorage
-    // for the lifetime of the browser profile as projects are deleted.
-    if (resp.ok) removeCachedTabs(id, workspaceContext);
+    // Drop per-project browser caches once the project is gone server-side so
+    // they do not accumulate in localStorage for the lifetime of the profile.
+    if (resp.ok) {
+      removeCachedTabs(id, workspaceContext);
+      removeDesignBrowserProjectCache(id);
+    }
     return resp.ok;
   } catch {
     return false;
