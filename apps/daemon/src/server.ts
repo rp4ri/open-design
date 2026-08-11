@@ -813,7 +813,14 @@ import {
 } from './collab/sync-snapshot-store.js';
 import { createPersistentSyncCache } from './collab/persistent-sync-cache.js';
 import { createSwrCache } from './collab/swr-cache.js';
-import { invalidateTeamResourceListingCaches } from './collab/team-resource-list-cache.js';
+import {
+  COLLAB_VELA_FANOUT_CONCURRENCY,
+  ConcurrencyGate,
+} from './collab/concurrency-gate.js';
+import {
+  createTeamResourceListCache,
+  invalidateTeamResourceListingCaches,
+} from './collab/team-resource-list-cache.js';
 import {
   createRememberedTeamResourceScopes,
   type RememberedTeamResourceScopeLease,
@@ -902,7 +909,12 @@ import { assertServerContextSatisfiesRoutes } from './route-context-contract.js'
 import { configureConnectorCredentialStore, connectorService, FileConnectorCredentialStore } from './connectors/service.js';
 import { composioConnectorProvider } from './connectors/composio.js';
 import { configureComposioConfigStore } from './connectors/composio-config.js';
-import { CHAT_TOOL_ENDPOINTS, CHAT_TOOL_OPERATIONS, toolTokenRegistry } from './tool-tokens.js';
+import {
+  CHAT_TOOL_ENDPOINTS,
+  CHAT_TOOL_OPERATIONS,
+  PROJECT_EXPORT_TOOL_ENDPOINT,
+  toolTokenRegistry,
+} from './tool-tokens.js';
 import {
   buildDeployFileSet,
   checkDeploymentUrl,
@@ -940,7 +952,7 @@ import {
   seedLibraryExtensionOrigins,
 } from './library-tokens.js';
 import { listLibraryTokenOrigins } from './library-store.js';
-import { apiTokenFromEnv, isApiAuthDisabled, isApiTokenMiddlewareEnabled } from './api-token-auth.js';
+import { apiTokenFromEnv, isApiAuthDisabled } from './api-token-auth.js';
 import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
 import { createWhatsNewService } from './services/whats-new.js';
 import { execCommandViaLoginShell } from './services/login-shell.js';
@@ -969,7 +981,7 @@ import {
   requireLocalDaemonRequest,
 } from './http/local-daemon-request.js';
 import { renderOAuthResultPage } from './http/oauth-result-page.js';
-import { createToolRequestAuth } from './http/tool-request-auth.js';
+import { bearerTokenFromRequest, createToolRequestAuth } from './http/tool-request-auth.js';
 
 /** @typedef {import('@open-design/contracts').ApiErrorCode} ApiErrorCode */
 /** @typedef {import('@open-design/contracts').ApiError} ApiError */
@@ -1455,6 +1467,12 @@ export function createAgentRuntimeEnv(
     },
     SANDBOX_RUNTIME,
   );
+  // The daemon API token authorizes the whole non-loopback API surface. Agent
+  // children receive only their run-scoped tool capability, never that broad
+  // credential inherited from the daemon process (including Windows casing).
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === 'OD_API_TOKEN') delete env[key];
+  }
   const sidecarIpcPath = baseEnv[SIDECAR_ENV.IPC_PATH];
   if (typeof sidecarIpcPath === 'string' && sidecarIpcPath.length > 0) {
     env[SIDECAR_ENV.IPC_PATH] = sidecarIpcPath;
@@ -1787,7 +1805,11 @@ export function composeChatUserRequestForAgent(
   const transition = formAnswerTransitionForCurrentPrompt(currentPrompt);
   if (!transition) return body;
   if (skip) {
-    return [transition, body].join('\n\n');
+    // The transition block already embeds the trimmed `currentPrompt`
+    // (the submitted form answers). On the resume path `body` IS
+    // `currentPrompt`, so appending it would ship the answers twice
+    // (issue #6239); the transition alone carries the whole turn.
+    return transition;
   }
   return [
     transition,
@@ -1958,6 +1980,8 @@ export function shouldReportRunCompletionTelemetryFallbackStatus(status: unknown
 
 const PROJECT_PREVIEW_SCOPE_TTL_MS = 60 * 60 * 1000;
 const PROJECT_PREVIEW_ASSET_PATH_RE = /^\/projects\/([^/]+)\/preview\/([^/]+)\/.+$/u;
+const PROJECT_RUN_SCOPED_EXPORT_PATH_RE =
+  /^\/projects\/[^/]+\/export(?:\/(?:pptx|pdf-image|image))?$/u;
 
 function createProjectPreviewScopeRegistry() {
   const scopes = new Map();
@@ -1969,15 +1993,18 @@ function createProjectPreviewScopeRegistry() {
   }
 
   return {
-    mint(projectId, workspace = null) {
+    mint(projectId, workspace = null, options = {}) {
       pruneExpired();
       const scope = randomUUID();
       scopes.set(scope, {
         projectId: String(projectId),
         workspace,
-        expiresAt: Date.now() + PROJECT_PREVIEW_SCOPE_TTL_MS,
+        expiresAt: Date.now() + (options.ttlMs ?? PROJECT_PREVIEW_SCOPE_TTL_MS),
       });
       return scope;
+    },
+    revoke(scope) {
+      scopes.delete(String(scope || ''));
     },
     validate(projectId, scope) {
       const key = String(scope || '');
@@ -2406,6 +2433,12 @@ export async function startServer({
   // are exempted so the desktop UI keeps working).
   const apiToken = apiTokenFromEnv();
   const apiAuthDisabled = isApiAuthDisabled();
+  const apiTokenAuthEnabled = apiToken.length > 0 && !apiAuthDisabled;
+  const isApiTokenAuthorization = (authorization: string | undefined): boolean => {
+    if (!apiTokenAuthEnabled) return false;
+    const match = /^Bearer\s+(\S+)\s*$/i.exec(authorization ?? '');
+    return match?.[1] === apiToken;
+  };
   if (!isLoopbackHostname(host) && apiToken.length === 0 && !apiAuthDisabled) {
     throw new Error(
       `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set. ` +
@@ -2439,13 +2472,14 @@ export async function startServer({
   // Loopback origins skip the
   // check (the desktop UI / local CLI never carry a bearer); every
   // other request must present `Authorization: Bearer <token>` with a
-  // value matching `OD_API_TOKEN`. Health / readiness / version remain
-  // open so monitoring probes don't need the token. Server-minted
+  // value matching `OD_API_TOKEN`. A currently valid run-scoped token may
+  // pass only an exact screenshot-export endpoint; its route rechecks the
+  // operation and project. Health / readiness / version remain open. Server-minted
   // project preview asset scopes are also accepted for GETs so sandboxed
   // browser iframes can load HTML/CSS/JS without privileged headers.
   // Rich daemon status stays authenticated because it includes local
   // runtime paths.
-  if (isApiTokenMiddlewareEnabled()) {
+  if (apiTokenAuthEnabled) {
     const openProbePaths = new Set([
       '/health',
       '/api/health',
@@ -2470,14 +2504,20 @@ export async function startServer({
       // bearer; the loopback bypass exists for the localhost desktop
       // UI which has no proxy in the path.
       if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
-      const auth = req.get('authorization') ?? '';
-      const match = /^Bearer\s+(\S+)\s*$/i.exec(auth);
-      if (!match || match[1] !== apiToken) {
-        return res.status(401).json({
-          error: { code: 'API_TOKEN_REQUIRED', message: 'Authorization: Bearer <OD_API_TOKEN> required' },
-        });
+      if (isApiTokenAuthorization(req.get('authorization'))) return next();
+      if (
+        req.method === 'POST'
+        && PROJECT_RUN_SCOPED_EXPORT_PATH_RE.test(req.path)
+        && toolTokenRegistry.validate(bearerTokenFromRequest(req), {
+          endpoint: PROJECT_EXPORT_TOOL_ENDPOINT,
+          operation: 'project:export',
+        }).ok
+      ) {
+        return next();
       }
-      return next();
+      return res.status(401).json({
+        error: { code: 'API_TOKEN_REQUIRED', message: 'Authorization: Bearer <OD_API_TOKEN> required' },
+      });
     });
   }
 
@@ -3010,6 +3050,15 @@ export async function startServer({
     verifyExplicitWorkspaceRequestContext({ req }, { fresh: false });
   const verifyWorkspaceRequestAuthority = (req: unknown) =>
     verifyExplicitWorkspaceRequestContext({ req });
+  const verifyPersonalProjectDeleteLeaseAuthority =
+    process.env.OD_WORKSPACE_CONTEXT_SOURCE?.trim() === 'vela'
+      ? (req: unknown) => verifyWorkspaceRequestContext({
+          req,
+          // A miss is intentionally returned as unavailable. The project gate
+          // then falls through to the existing fresh authority verifier.
+          fetchWorkspaceDirectory: workspaceDirectoryAuthority.cached,
+        })
+      : undefined;
   const enforceAuthoritativeProjectMutation = createEnforceWorkspaceProjectMutation(
     verifyWorkspaceRequestAuthority,
   );
@@ -5730,62 +5779,29 @@ export async function startServer({
       },
     },
   );
-  const teamResourceScopeKey = (scope: TeamResourceRequestScope): string =>
-    JSON.stringify([
-      scope.principal.teamId,
-      scope.principal.memberId,
-      scope.principal.role,
-      scope.principal.lifecycleState,
-    ]);
+  // ONE materialization budget for the whole daemon, not one per resource kind.
+  // Design systems, plugins, and skills are three separate listing caches that
+  // a single client poll refreshes together, so a gate owned by each cache
+  // would bound each kind on its own and let the real peak reach the cap times
+  // three. The gate lives here, at the composition root, because here is the
+  // only place that can see all three.
+  const teamResourceMaterializationGate = new ConcurrencyGate(
+    COLLAB_VELA_FANOUT_CONCURRENCY,
+  );
   const cachedTeamResourceList = (
     share: TeamResourceShareService,
     sync?: (
       resource: TeamResourceShareRecord,
       scope: TeamResourceRequestScope,
     ) => Promise<void>,
-  ) => {
-    const listings = new Map<
-      string,
-      ReturnType<typeof createSwrCache<{
-        ids: string[];
-        resources: TeamResourceShareRecord[];
-      }>>
-    >();
-    const materialize = async (
-      scope: TeamResourceRequestScope,
-      readOptions?: TeamResourceSharedReadOptions,
-    ) => {
-      const resources = await share.sharedResources(scope, readOptions);
-      if (sync) {
-        await Promise.all(resources.map((resource) => sync(resource, scope)));
-      }
-      return { ids: resources.map((resource) => resource.id), resources };
-    };
-    const read = async (scope: TeamResourceRequestScope) => {
-      const key = teamResourceScopeKey(scope);
-      let listing = listings.get(key);
-      if (!listing) {
-        listing = createSwrCache(
-          () => materialize(scope),
-          () => key,
-          3000,
-        );
-        listings.set(key, listing);
-      }
-      return listing();
-    };
-    return Object.assign(read, {
-      authoritative(scope: TeamResourceRequestScope) {
-        return materialize(scope, { authoritative: true });
-      },
-      invalidate(scope: TeamResourceRequestScope) {
-        const key = teamResourceScopeKey(scope);
-        listings.get(key)?.invalidate();
-        listings.delete(key);
-        sharedTeamResourcesCommand.invalidate(scope.principal.teamId);
-      },
+  ) =>
+    createTeamResourceListCache({
+      share,
+      ...(sync ? { sync } : {}),
+      gate: teamResourceMaterializationGate,
+      invalidateSharedCommand: (workspaceId) =>
+        sharedTeamResourcesCommand.invalidate(workspaceId),
     });
-  };
   const runTeamResourceCommand = async (
     args: string[],
     workspaceId?: string,
@@ -6674,7 +6690,7 @@ export async function startServer({
     options,
   ) => {
     const binding = getWorkspaceProjectByProjectId(db, projectId);
-    if (!binding?.workspaceId) return true;
+    if (!binding?.workspaceId) return { workspace: null };
 
     let authority;
     if (process.env.OD_WORKSPACE_CONTEXT_SOURCE?.trim() === 'vela') {
@@ -6689,7 +6705,7 @@ export async function startServer({
           'workspace membership authority is temporarily unavailable',
           { retryable: true },
         );
-        return false;
+        return null;
       }
       const item = directory.items.find(
         (candidate) => candidate.workspaceId === binding.workspaceId,
@@ -6701,7 +6717,7 @@ export async function startServer({
           'WORKSPACE_PROJECT_PERMISSION_DENIED',
           'workspace project access is not allowed',
         );
-        return false;
+        return null;
       }
       authority = workspaceContextFromDirectoryItem(item);
     } else {
@@ -6739,7 +6755,13 @@ export async function startServer({
         return undefined;
       },
     };
-    return scopedAuthorize(request, res, projectId, options);
+    if (!await scopedAuthorize(request, res, projectId, options)) return null;
+    return {
+      workspace: {
+        workspaceId: authority.workspaceId,
+        workspaceMemberId: authority.workspaceMemberId,
+      },
+    };
   };
   const projectFileDeps = {
     ensureProject,
@@ -7024,6 +7046,7 @@ export async function startServer({
     // workspaceContext) — see the mutation-gate cross-check note above.
     verifyWorkspaceReadAuthority,
     verifyWorkspaceRequestAuthority,
+    verifyPersonalProjectDeleteLeaseAuthority,
     authorizeProjectRequest,
     isProjectRevoked: (projectId) =>
       revokedTeamProjectMirrors.has(projectId),
@@ -7513,7 +7536,11 @@ export async function startServer({
     exports: projectExportDeps,
     projectFiles: projectFileDeps,
     validation: validationDeps,
+    auth: authDeps,
     authorizeProjectRequest,
+    authorizeProjectToolRequest,
+    isApiTokenAuthorization,
+    projectPreviewScopes,
   });
   registerProjectFileRoutes(app, {
     db,
@@ -8668,13 +8695,16 @@ export async function startServer({
         const stages = snap?.pipeline?.stages ?? [];
         if (stages.length > 0) {
           const { loadAtomBodies } = await import('./plugins/atom-bodies.js');
-          const { renderActiveStageBlock } = await import('@open-design/contracts');
-          const blocks = [];
+          const { renderActiveStageBlocks } = await import('@open-design/contracts');
+          const stageViews = [];
           for (const stage of stages) {
             const bodies = await loadAtomBodies(db, stage.atoms ?? []);
-            const block = renderActiveStageBlock({ stageId: stage.id, bodies });
-            if (block.trim().length > 0) blocks.push(block);
+            stageViews.push({ stageId: stage.id, bodies });
           }
+          // Issue #6238 — the builder inlines each atom body exactly
+          // once across the pipeline; stages that re-declare an atom
+          // get a one-line back-reference instead of the full body.
+          const blocks = renderActiveStageBlocks(stageViews);
           if (blocks.length > 0) activeStageBlocks = blocks;
         }
       } catch (err) {
@@ -10000,6 +10030,7 @@ export async function startServer({
         ...(failure?.failure_category ? { failure_category: failure.failure_category } : {}),
         ...(failure?.failure_detail ? { failure_detail: failure.failure_detail } : {}),
         ...(failure?.failure_stage ? { failure_stage: failure.failure_stage } : {}),
+        ...(failure?.terminal_trigger ? { terminal_trigger: failure.terminal_trigger } : {}),
         ...(errorCode ? { error_code: errorCode } : {}),
       };
     };
@@ -10073,6 +10104,7 @@ export async function startServer({
       // this reset, a clean-but-empty attempt 1 would vouch for a crashed
       // attempt 2, classifying the run 'succeeded' off a stale flag.
       run.turnCompletedCleanly = false;
+      run.terminalTrigger = null;
       lifecycle.resetForAttempt(run.retryAttemptCount ?? 0);
       run.analyticsTelemetry = {
         startRequestedAt: run.analyticsTelemetry?.startRequestedAt ?? run.createdAt,
@@ -10212,6 +10244,8 @@ export async function startServer({
         },
         ...(errorCode ? { errorCode } : {}),
         agentId: run.agentId,
+        cancelOrigin: run.cancelOrigin ?? null,
+        terminalTrigger: run.terminalTrigger ?? null,
         events: run.events,
       });
       if (
@@ -11185,6 +11219,9 @@ export async function startServer({
           'Retry the turn, pick a different model, or start a new conversation if the prior context is very large.';
         stallPayload = createSseErrorPayload('AGENT_EXECUTION_FAILED', message, { retryable: true });
       }
+      run.terminalTrigger = reason === 'first_output'
+        ? 'first_output_deadline'
+        : 'inactivity_watchdog';
       send('error', stallPayload);
       // A silent first-token hang is one of the safe transient failure shapes
       // this run is allowed to recover: classifyRunFailure maps the stall text
@@ -13847,6 +13884,7 @@ export async function startServer({
     projectStore: projectStoreDeps,
     authorizeProjectRequest,
     authorizeProjectToolRequest,
+    isApiTokenAuthorization,
     projectFiles: projectFileDeps,
     conversations: conversationDeps,
     templates: templateDeps,
@@ -13937,6 +13975,7 @@ export async function startServer({
   return await new Promise((resolve, reject) => {
     let daemonShutdownStarted = false;
     const cleanupDaemonBackgroundWork = () => {
+      telemetry.disposeFatalHandlers();
       composioConnectorProvider.stopCatalogRefreshLoop();
       orbitService.stop();
       routineService?.stop();
