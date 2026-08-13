@@ -196,6 +196,35 @@ export interface RegisterCollabContextRoutesDeps {
 
 const ASSIGNABLE_ROLES = new Set<WorkspaceInviteRole>(['admin', 'member']);
 
+/**
+ * Enrichment may add billing and display metadata, but it must not rewrite the
+ * exact Workspace authority already proven by the membership directory.
+ */
+function enrichVerifiedWorkspaceContext(
+  verified: WorkspaceCollabContext,
+  enriched: WorkspaceCollabContext | null | undefined,
+): WorkspaceCollabContext {
+  if (
+    !enriched
+    || enriched.workspaceId !== verified.workspaceId
+    || enriched.workspaceMemberId !== verified.workspaceMemberId
+  ) {
+    return verified;
+  }
+  const { teamId: _enrichedTeamId, ...enrichedMetadata } = enriched;
+  return {
+    ...enrichedMetadata,
+    workspaceId: verified.workspaceId,
+    workspaceType: verified.workspaceType,
+    workspaceMemberId: verified.workspaceMemberId,
+    role: verified.role,
+    memberStatus: verified.memberStatus,
+    lifecycleState: verified.lifecycleState,
+    permissions: verified.permissions,
+    ...(verified.teamId ? { teamId: verified.teamId } : {}),
+  };
+}
+
 function workspaceGroupProperties(
   context: WorkspaceCollabContext,
 ): Record<string, unknown> {
@@ -295,12 +324,15 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
       VerifiedWorkspaceRequestContextResult,
       { ok: true }
     >,
-  ) =>
-    res.status(verified.status).json({
-      error: verified.code,
-      message: verified.message,
-      ...(verified.retryable ? { retryable: true } : {}),
-    });
+  ) => verified.code === 'AMR_AUTH_REQUIRED'
+    ? sendApiError(res, verified.status, verified.code, verified.message, {
+        retryable: false,
+      })
+    : res.status(verified.status).json({
+        error: verified.code,
+        message: verified.message,
+        ...(verified.retryable ? { retryable: true } : {}),
+      });
 
   // Desktop invite hand-off ("桌面唤起和本地恢复"): the desktop app parses the
   // opendesign:// invite deeplink and POSTs the nonce here. The daemon consumes
@@ -382,12 +414,7 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
       authorization,
       workspaceId: verified.context.workspaceId,
     }).catch(() => null);
-    const context =
-      enriched
-      && enriched.workspaceId === verified.context.workspaceId
-      && enriched.workspaceMemberId === verified.context.workspaceMemberId
-        ? enriched
-        : verified.context;
+    const context = enrichVerifiedWorkspaceContext(verified.context, enriched);
     const body: WorkspaceContextResponse = { context };
     void deps.observeWorkspace?.(req, context, workspaceGroupProperties(context));
     res.json(body);
@@ -460,6 +487,15 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
       (): WorkspaceDirectoryFetchResult => ({ ok: false, items: [] }),
     );
     if (!directory.ok) {
+      if (directory.reason === 'unauthorized') {
+        return sendApiError(
+          res,
+          401,
+          'AMR_AUTH_REQUIRED',
+          'AMR authorization expired. Sign in again to continue.',
+          { retryable: false },
+        );
+      }
       return res.status(503).json({
         error: 'WORKSPACE_AUTHORITY_UNAVAILABLE',
         message: 'workspace membership authority is temporarily unavailable',
@@ -490,6 +526,15 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
       (): WorkspaceDirectoryFetchResult => ({ ok: false, items: [] }),
     );
     if (!directoryResult.ok) {
+      if (directoryResult.reason === 'unauthorized') {
+        return sendApiError(
+          res,
+          401,
+          'AMR_AUTH_REQUIRED',
+          'AMR authorization expired. Sign in again to continue.',
+          { retryable: false },
+        );
+      }
       return res.status(503).json({
         error: 'WORKSPACE_AUTHORITY_UNAVAILABLE',
         message: 'workspace membership authority is temporarily unavailable',
@@ -652,6 +697,15 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
         (): WorkspaceDirectoryFetchResult => ({ ok: false, items: [] }),
       );
       if (!directoryResult.ok) {
+        if (directoryResult.reason === 'unauthorized') {
+          return sendApiError(
+            res,
+            401,
+            'AMR_AUTH_REQUIRED',
+            'AMR authorization expired. Sign in again to continue.',
+            { retryable: false },
+          );
+        }
         return res.status(503).json({ error: 'workspace_directory_unavailable' });
       }
       const unauthorized = interests.filter(
@@ -749,6 +803,15 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
           requestedWorkspaceId,
           'workspace_directory_unavailable',
         );
+        if (directoryResult.reason === 'unauthorized') {
+          return sendApiError(
+            res,
+            401,
+            'AMR_AUTH_REQUIRED',
+            'AMR authorization expired. Sign in again to continue.',
+            { retryable: false },
+          );
+        }
         return res.status(503).json({ error: 'workspace_directory_unavailable' });
       }
       membership = directoryResult.items.find(

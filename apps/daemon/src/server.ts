@@ -39,6 +39,7 @@ import {
   type StableSectionHashes,
 } from './prompts/stable-sections.js';
 import { emittedRenderableQuestionForm } from './question-form-detect.js';
+import { runHadFailedDesignSystemWrapper } from './runtimes/run-artifacts.js';
 import { resolveProjectRoot } from './project-root.js';
 import { OPEN_DESIGN_PLUGIN_ID } from './mcp-observability.js';
 import {
@@ -306,6 +307,7 @@ import {
   createUserDesignSystem,
   deleteUserDesignSystem,
   digestDesignSystemContext,
+  isDesignTokenChannelEnabled,
   isTeamSyncedUserDesignSystem,
   LEGACY_DESIGN_SYSTEM_ARTIFACTS,
   linkUserDesignSystemProject,
@@ -318,6 +320,7 @@ import {
   readUserDesignSystemFile,
   readUserDesignSystemFileBytes,
   resolveDesignSystemAssets,
+  resolveDesignSystemRuntimePromptContext,
   stripPrefixAndValidateId,
   syncUserDesignSystemAssetsFromFiles,
   updateUserDesignSystem,
@@ -329,6 +332,10 @@ import {
   deleteWorkspaceOwnedDesignSystem as removeWorkspaceOwnedDesignSystem,
 } from './design-systems/workspace-owned-create.js';
 import { createDesignSystemGenerationJobStore } from './design-systems/generation-jobs.js';
+import {
+  pinRunDesignSystemScope,
+  resolvePinnedRunDesignSystemScope,
+} from './design-systems/run-scope.js';
 import { createDesignSystemServerServices } from './design-systems/server-services.js';
 import {
   designSystemIdFromWorkspaceTeamBinding,
@@ -372,6 +379,7 @@ import {
   registerBuiltInAtomWorkers,
   registerBundledPlugins,
   registryRootsForDataDir,
+  resolveLocalPluginBySource,
   restoreProjectSnapshotLink,
   resolvePluginSnapshot,
   runPipelineForRun,
@@ -459,6 +467,7 @@ import {
   createRunArtifactBaselines,
   diffRunArtifacts,
   snapshotProjectArtifacts,
+  snapshotProjectArtifactsAsync,
 } from './run-artifact-fs.js';
 import {
   AiHtmlVersionSnapshotError,
@@ -540,7 +549,13 @@ import {
   readAllTokens,
   setToken,
 } from './mcp-tokens.js';
-import { agentCliEnvForAgent, readAppConfig, readPluginEnvKnobs, writeAppConfig } from './app-config.js';
+import {
+  agentCliEnvForAgent,
+  readAppConfig,
+  readAppConfigSync,
+  readPluginEnvKnobs,
+  writeAppConfig,
+} from './app-config.js';
 import { OrbitService, formatLocalProjectTimestamp, renderOrbitTemplateSystemPrompt } from './orbit.js';
 import { buildOrbitNoLiveArtifactSummary } from './orbit-agent-summary.js';
 import {
@@ -552,8 +567,8 @@ import { buildMcpInstallPayload } from './mcp-install-info.js';
 import { createDiagnosticsExportHandler } from './diagnostics-export.js';
 import { DIAGNOSTICS_EXPORT_PATH } from '@open-design/diagnostics';
 import {
-  buildProjectArchive,
-  buildBatchArchive,
+  createProjectArchiveStream,
+  createBatchArchiveStream,
   createProjectFolder,
   decodeMultipartFilename,
   deleteProjectFile,
@@ -828,6 +843,7 @@ import {
   createTeamResourceListCache,
   invalidateTeamResourceListingCaches,
 } from './collab/team-resource-list-cache.js';
+import { createVelaResourcePullBatcher } from './collab/vela-cli-resource-pull-batcher.js';
 import {
   createRememberedTeamResourceScopes,
   type RememberedTeamResourceScopeLease,
@@ -924,6 +940,7 @@ import {
   CHAT_TOOL_ENDPOINTS,
   CHAT_TOOL_OPERATIONS,
   PROJECT_EXPORT_TOOL_ENDPOINT,
+  resolveChatToolTokenTtlMs,
   toolTokenRegistry,
 } from './tool-tokens.js';
 import {
@@ -963,7 +980,13 @@ import {
   seedLibraryExtensionOrigins,
 } from './library-tokens.js';
 import { listLibraryTokenOrigins } from './library-store.js';
-import { apiTokenFromEnv, isApiAuthDisabled } from './api-token-auth.js';
+import {
+  API_TOKEN_BASIC_CHALLENGE,
+  apiTokenAuthorizationMatches,
+  apiTokenFromEnv,
+  isApiAuthDisabled,
+  isApiTokenMiddlewareEnabled,
+} from './api-token-auth.js';
 import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
 import { createWhatsNewService } from './services/whats-new.js';
 import { execCommandViaLoginShell } from './services/login-shell.js';
@@ -2432,6 +2455,7 @@ export interface StartServerOptions {
   port?: number;
   returnServer?: boolean;
   runtime?: DaemonRuntimeContext | null;
+  staticDir?: string;
 }
 
 export interface StartServerResult {
@@ -2449,6 +2473,7 @@ export async function startServer({
   desktopSlideRenderer = null,
   desktopArtifactExporter = null,
   runtime = null,
+  staticDir = STATIC_DIR,
 }: StartServerOptions = {}) {
   host = normalizeDaemonBindHost(host);
   let resolvedPort = port;
@@ -2468,16 +2493,13 @@ export async function startServer({
   // Loopback hosts (127.0.0.1 / ::1 / localhost) are always allowed —
   // the desktop / dev flow remains unchanged. Setting OD_API_TOKEN is
   // purely additive: when present, every /api/* request must carry a
-  // matching `Authorization: Bearer <token>` header (loopback origins
+  // matching Bearer token or browser Basic credentials (loopback origins
   // are exempted so the desktop UI keeps working).
   const apiToken = apiTokenFromEnv();
   const apiAuthDisabled = isApiAuthDisabled();
   const apiTokenAuthEnabled = apiToken.length > 0 && !apiAuthDisabled;
-  const isApiTokenAuthorization = (authorization: string | undefined): boolean => {
-    if (!apiTokenAuthEnabled) return false;
-    const match = /^Bearer\s+(\S+)\s*$/i.exec(authorization ?? '');
-    return match?.[1] === apiToken;
-  };
+  const isApiTokenAuthorization = (authorization: string | undefined): boolean =>
+    apiTokenAuthEnabled && apiTokenAuthorizationMatches(authorization, apiToken);
   if (!isLoopbackHostname(host) && apiToken.length === 0 && !apiAuthDisabled) {
     throw new Error(
       `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set. ` +
@@ -2505,16 +2527,16 @@ export async function startServer({
   app.use(express.json({ limit: '4mb' }));
   const projectPreviewScopes = createProjectPreviewScopeRegistry();
 
-  // Plan §3.K1 — bearer-token middleware.
+  // Plan §3.K1 — API-token middleware.
   //
   // Active only when OD_API_TOKEN is set and API auth is not disabled.
-  // Loopback origins skip the
-  // check (the desktop UI / local CLI never carry a bearer); every
-  // other request must present `Authorization: Bearer <token>` with a
-  // value matching `OD_API_TOKEN`. A currently valid run-scoped token may
-  // pass only an exact screenshot-export endpoint; its route rechecks the
-  // operation and project. Health / readiness / version remain open. Server-minted
-  // project preview asset scopes are also accepted for GETs so sandboxed
+  // Loopback origins skip the check (the desktop UI / local CLI never carry
+  // credentials); every other request must present a matching bearer token
+  // (CLI / proxy) or matching HTTP Basic credentials (browser UI). A currently
+  // valid run-scoped token may pass only an exact screenshot-export endpoint;
+  // its route rechecks the operation and project. Health / readiness / version
+  // remain open. Server-minted project preview asset scopes are also accepted
+  // for GETs so sandboxed
   // browser iframes can load HTML/CSS/JS without privileged headers.
   // Rich daemon status stays authenticated because it includes local
   // runtime paths.
@@ -2540,10 +2562,10 @@ export async function startServer({
       }
       // Loopback short-circuit. We ignore the proxied X-Forwarded-For
       // header here because a reverse proxy MUST always forward the
-      // bearer; the loopback bypass exists for the localhost desktop
+      // credentials; the loopback bypass exists for the localhost desktop
       // UI which has no proxy in the path.
       if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
-      if (isApiTokenAuthorization(req.get('authorization'))) return next();
+      if (apiTokenAuthorizationMatches(req.get('authorization'), apiToken)) return next();
       if (
         req.method === 'POST'
         && PROJECT_RUN_SCOPED_EXPORT_PATH_RE.test(req.path)
@@ -2554,9 +2576,30 @@ export async function startServer({
       ) {
         return next();
       }
+      res.setHeader('WWW-Authenticate', API_TOKEN_BASIC_CHALLENGE);
       return res.status(401).json({
-        error: { code: 'API_TOKEN_REQUIRED', message: 'Authorization: Bearer <OD_API_TOKEN> required' },
+        error: {
+          code: 'API_TOKEN_REQUIRED',
+          message: 'Authorization: Bearer <OD_API_TOKEN> or browser Basic authentication required',
+        },
       });
+    });
+
+    // Docker Desktop forwards host-browser traffic across its bridge, so the
+    // daemon correctly sees a non-loopback peer. Challenge the SPA document
+    // navigation before serving any shell bytes; browsers then cache the Basic
+    // credentials for same-origin /api requests. Static assets do not need a
+    // separate challenge because the authenticated shell is the only entry
+    // point and API routes still enforce credentials independently.
+    app.use((req, res, next) => {
+      if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
+      if (resolveStaticSpaFallbackPath(req, staticDir) === null) return next();
+      if (apiTokenAuthorizationMatches(req.get('authorization'), apiToken)) return next();
+
+      res.setHeader('WWW-Authenticate', API_TOKEN_BASIC_CHALLENGE);
+      return res.status(401).type('text/plain').send(
+        'Open Design authentication required. Use username "open-design" and OD_API_TOKEN as the password.',
+      );
     });
   }
 
@@ -2765,7 +2808,9 @@ export async function startServer({
     PLUGIN_LOCKFILE_PATH,
     PLUGIN_UPLOAD_MAX_BYTES,
   });
-  const mediaTaskStore = createMediaTaskStore(db);
+  const mediaTaskStore = createMediaTaskStore(db, {
+    isRunActive: (runId) => toolTokenRegistry.activeRunTokenCount(runId) > 0,
+  });
   const {
     authorizeToolRequest,
     optionalToolGrantFromRequest,
@@ -2961,8 +3006,8 @@ export async function startServer({
     console.warn('[od] Failed to recover stale live artifact refreshes:', error);
   });
 
-  if (fs.existsSync(STATIC_DIR)) {
-    app.use(express.static(STATIC_DIR));
+  if (fs.existsSync(staticDir)) {
+    app.use(express.static(staticDir));
   }
 
   // ---- Projects (DB-backed) -------------------------------------------------
@@ -3017,12 +3062,20 @@ export async function startServer({
   // recorded in — and a project-scoped collab call may only be pinned to — a
   // workspace that can actually host a team plane. See collab/team-share-scope.ts.
   const workspaceTypes = createWorkspaceTypeRegistry();
+  const configuredAmrEnv = () =>
+    agentCliEnvForAgent(readAppConfigSync(RUNTIME_DATA_DIR).agentCliEnv, 'amr');
   const workspaceDirectoryAuthority = createWorkspaceDirectoryAuthorityBroker({
     fetchDirectory: async () => {
-      const result = await fetchVelaWorkspaceDirectory();
+      const result = await fetchVelaWorkspaceDirectory({
+        configuredEnv: configuredAmrEnv(),
+      });
       if (result.ok) workspaceTypes.learn(result.items);
       return result;
     },
+    identityKey: () => velaWorkspaceDirectoryIdentity(
+      readVelaControlApiContext,
+      configuredAmrEnv(),
+    ),
     onDecision: (input) => recordWorkspaceAuthorityDecision({
       mode: workspaceAuthorityCacheMode,
       ...input,
@@ -3282,7 +3335,10 @@ export async function startServer({
   );
   const workspaceExactContextCache = createWorkspaceExactContextCache({
     provider: workspaceContext,
-    identity: () => velaWorkspaceDirectoryIdentity(),
+    identity: () => velaWorkspaceDirectoryIdentity(
+      readVelaControlApiContext,
+      configuredAmrEnv(),
+    ),
     onDecision: (input) => recordWorkspaceAuthorityDecision({
       mode: workspaceAuthorityCacheMode,
       ...input,
@@ -3318,8 +3374,9 @@ export async function startServer({
       : null;
   };
   const verifyWorkspaceContextReadAuthority = async (req: unknown) => {
-    const cached = cachedWorkspaceContextForRequest(req);
-    if (cached) return { ok: true as const, context: cached };
+    // `resolveExact` is enrichment, including when its strict-SSE lease is
+    // healthy. Only the membership directory can supply authority-bearing
+    // type, role, lifecycle, and permissions for the context response.
     return verifyWorkspaceReadAuthority(req);
   };
   /**
@@ -5604,7 +5661,6 @@ export async function startServer({
     }
 
     try {
-      const { runVelaResourceCommand } = await import('./collab/vela-cli-resource-adapter.js');
       const materialized = await materializeWorkspaceScopedTeamResource({
         kindRoot: PLUGIN_REGISTRY_ROOTS.userPluginsRoot,
         storageName: resource.id,
@@ -5615,15 +5671,13 @@ export async function startServer({
           hubResourceId,
         },
         pullInto: (stagedFolder) =>
-          runVelaResourceCommand([
-            'pull',
-            'plugin',
-            hubResourceId,
-            stagedFolder,
-            '--ref',
-            'published',
-            '--json',
-          ], workspaceId).then(() => undefined),
+          teamResourcePullBatcher.pull({
+            workspaceId,
+            kind: 'plugin',
+            resourceId: hubResourceId,
+            dir: stagedFolder,
+            ref: 'published',
+          }),
         verifyWorkspaceScope: () => teamResourceScopeStillAuthorized(scope),
         verifyStillShared: () => teamResourceStillShared('plugin', resource, scope),
       });
@@ -5764,7 +5818,6 @@ export async function startServer({
       return;
     }
     try {
-      const { runVelaResourceCommand } = await import('./collab/vela-cli-resource-adapter.js');
       const materialized = await materializeWorkspaceScopedTeamResource({
         kindRoot: USER_DESIGN_SYSTEMS_DIR,
         storageName: dirId,
@@ -5775,15 +5828,13 @@ export async function startServer({
           hubResourceId,
         },
         pullInto: (stagedFolder) =>
-          runVelaResourceCommand([
-            'pull',
-            'design_system',
-            hubResourceId,
-            stagedFolder,
-            '--ref',
-            'published',
-            '--json',
-          ], workspaceId).then(() => undefined),
+          teamResourcePullBatcher.pull({
+            workspaceId,
+            kind: 'design_system',
+            resourceId: hubResourceId,
+            dir: stagedFolder,
+            ref: 'published',
+          }),
         verifyWorkspaceScope: () => teamResourceScopeStillAuthorized(scope),
         verifyStillShared: () =>
           teamResourceStillShared('design_system', resource, scope),
@@ -5894,7 +5945,6 @@ export async function startServer({
     }
 
     try {
-      const { runVelaResourceCommand } = await import('./collab/vela-cli-resource-adapter.js');
       const materialized = await materializeWorkspaceScopedTeamResource({
         kindRoot: USER_SKILLS_DIR,
         storageName: dirId,
@@ -5905,15 +5955,13 @@ export async function startServer({
           hubResourceId,
         },
         pullInto: (stagedFolder) =>
-          runVelaResourceCommand([
-            'pull',
-            'skill',
-            hubResourceId,
-            stagedFolder,
-            '--ref',
-            'published',
-            '--json',
-          ], workspaceId).then(() => undefined),
+          teamResourcePullBatcher.pull({
+            workspaceId,
+            kind: 'skill',
+            resourceId: hubResourceId,
+            dir: stagedFolder,
+            ref: 'published',
+          }),
         verifyWorkspaceScope: () => teamResourceScopeStillAuthorized(scope),
         verifyStillShared: () => teamResourceStillShared('skill', resource, scope),
       });
@@ -6002,6 +6050,7 @@ export async function startServer({
   const teamResourceMaterializationGate = new ConcurrencyGate(
     COLLAB_VELA_FANOUT_CONCURRENCY,
   );
+  const teamResourcePullBatcher = createVelaResourcePullBatcher();
   const cachedTeamResourceList = (
     share: TeamResourceShareService,
     sync?: (
@@ -7027,8 +7076,8 @@ export async function startServer({
   const projectEventDeps = { subscribeFileEvents, activeProjectEventSinks };
   const importDeps = { importClaudeDesignZip, projectDir, detectEntryFile };
   const projectExportDeps = {
-    buildProjectArchive,
-    buildBatchArchive,
+    createProjectArchiveStream,
+    createBatchArchiveStream,
     buildDesktopPdfExportInput,
     buildDesktopArtifactExportInput,
     desktopPdfExporter,
@@ -7275,6 +7324,11 @@ export async function startServer({
         id,
         options.workspaceId,
         options.workspaceMemberId,
+      ),
+      getLocalPluginBySource: (id, source) => getLocalPluginBySource(
+        db,
+        id,
+        source,
       ),
     },
     events: projectEventDeps,
@@ -7698,8 +7752,28 @@ export async function startServer({
   registerDesignSystemToolRoutes(app, {
     auth: authDeps,
     http: httpDeps,
-    paths: pathDeps,
+    paths: {
+      ...pathDeps,
+      resolveUserDesignSystemsRoot: (grant, designSystemId) => {
+        if (!designSystemId.startsWith('user:')) {
+          return { ok: true, root: USER_DESIGN_SYSTEMS_DIR };
+        }
+        const resolved = resolvePinnedRunDesignSystemScope({
+          db,
+          scope: grant.designSystemScope,
+          designSystemId,
+          userRoot: USER_DESIGN_SYSTEMS_DIR,
+        });
+        return resolved.ok
+          ? { ok: true, root: resolved.root }
+          : resolved;
+      },
+    },
     projects: { getProject: (id: string) => getProject(db, id) },
+    runs: { getRun: (id: string) => design.runs.get(id) },
+    features: {
+      isDesignSystemRuntimeEnabled: () => isDesignTokenChannelEnabled(process.env),
+    },
   });
   app.use('/artifacts', express.static(ARTIFACTS_DIR));
   app.use(
@@ -8184,6 +8258,16 @@ export async function startServer({
       (plugin) => plugin.id === id,
     ) ?? null;
   };
+  const getLocalPluginBySource = async (
+    dbHandle,
+    id: string,
+    source: string,
+  ) => resolveLocalPluginBySource({
+    db: dbHandle,
+    id,
+    source,
+    userPluginsRoot: PLUGIN_REGISTRY_ROOTS.userPluginsRoot,
+  });
 
   registerPluginRoutes(app, {
     db,
@@ -8206,6 +8290,7 @@ export async function startServer({
       listInstalledPlugins: listWorkspacePlugins,
       getInstalledPlugin,
       getWorkspacePlugin: getWorkspacePluginForRequest,
+      getLocalPluginBySource,
       installPlugin,
       isSafePluginId,
       uninstallPlugin,
@@ -8310,25 +8395,48 @@ export async function startServer({
     freeformDeckSignal,
     mediaHintSignal,
     platformHintSignal,
+    workspaceScope,
+    designSystemScope,
   }) => {
     const project =
       typeof projectId === 'string' && projectId
         ? getProject(db, projectId)
         : null;
-    const projectWorkspaceBinding =
-      typeof projectId === 'string' && projectId
-        ? getWorkspaceProjectByProjectId(db, projectId)
-        : null;
     const projectWorkspaceId =
-      typeof projectWorkspaceBinding?.workspaceId === 'string'
-        ? projectWorkspaceBinding.workspaceId.trim()
+      typeof workspaceScope?.workspaceId === 'string'
+        ? workspaceScope.workspaceId.trim()
         : '';
     const projectCreatorMemberId =
-      typeof projectWorkspaceBinding?.createdByWorkspaceMemberId === 'string'
-        ? projectWorkspaceBinding.createdByWorkspaceMemberId.trim()
+      typeof workspaceScope?.workspaceMemberId === 'string'
+        ? workspaceScope.workspaceMemberId.trim()
         : '';
+    const metadata = project?.metadata;
+    const localCatalogScope = (value) => {
+      const workspaceId = typeof value?.workspaceId === 'string'
+        ? value.workspaceId.trim()
+        : '';
+      const workspaceMemberId = typeof value?.workspaceMemberId === 'string'
+        ? value.workspaceMemberId.trim()
+        : '';
+      return workspaceId && workspaceMemberId
+        ? { workspaceId, workspaceMemberId }
+        : null;
+    };
+    // Resource provenance is intentionally independent from project
+    // attribution. A Home selection can be staged while Workspace identity is
+    // transitioning; the daemon persists the local catalogue partition so
+    // the first run reads the same local record without waiting for identity
+    // discovery or treating this as remote membership authority.
+    const skillCatalogScope = localCatalogScope(metadata?.localCatalogScopes?.skill);
+    const designSystemCatalogScope = localCatalogScope(
+      metadata?.localCatalogScopes?.designSystem,
+    );
+    const designSystemWorkspaceId =
+      designSystemCatalogScope?.workspaceId ?? projectWorkspaceId;
+    const designSystemMemberId =
+      designSystemCatalogScope?.workspaceMemberId ?? projectCreatorMemberId;
     const projectDesignSystemBinding = (summary) => {
-      if (!projectWorkspaceId || summary?.source === 'built-in') return null;
+      if (!designSystemWorkspaceId || summary?.source === 'built-in') return null;
       const logicalResourceId =
         typeof summary?.id === 'string' ? summary.id.trim() : '';
       if (!logicalResourceId) return null;
@@ -8336,9 +8444,9 @@ export async function startServer({
         const canonicalTeamBinding = getWorkspaceResource(
           db,
           'design_system',
-          projectWorkspaceId,
+          designSystemWorkspaceId,
           workspaceTeamDesignSystemBindingResourceId(
-            projectWorkspaceId,
+            designSystemWorkspaceId,
             logicalResourceId,
           ),
         );
@@ -8349,7 +8457,7 @@ export async function startServer({
       return getWorkspaceResource(
         db,
         'design_system',
-        projectWorkspaceId,
+        designSystemWorkspaceId,
         logicalResourceId,
       ) ?? null;
     };
@@ -8358,7 +8466,7 @@ export async function startServer({
       // A truly unbound local project is the legacy CLI/BYOK lane. Bound
       // projects must resolve resources from their persisted project scope;
       // shell/current Workspace state never participates.
-      if (!projectWorkspaceId) return true;
+      if (!designSystemWorkspaceId) return true;
       const binding = projectDesignSystemBinding(summary);
       if (
         !binding
@@ -8368,8 +8476,8 @@ export async function startServer({
       }
       if (binding.visibility === 'team') return true;
       return binding.visibility === 'personal'
-        && Boolean(projectCreatorMemberId)
-        && binding.createdByWorkspaceMemberId?.trim() === projectCreatorMemberId;
+        && Boolean(designSystemMemberId)
+        && binding.createdByWorkspaceMemberId?.trim() === designSystemMemberId;
     };
     let appConfigForPrompt = null;
     try {
@@ -8394,7 +8502,6 @@ export async function startServer({
     }
     const effectiveSkillId =
       typeof skillId === 'string' && skillId ? skillId : project?.skillId;
-    const metadata = project?.metadata;
     // Website Clone runs reproduce someone else's site: the fidelity target
     // is the original page. Treating a project/app design system as
     // authoritative would overwrite the cloned site's palette/typography
@@ -8416,20 +8523,18 @@ export async function startServer({
           allowAppDefault: project === null,
         });
     const effectiveDesignSystemId = designSystemSelection.id;
-    const projectResourceScope =
-      typeof projectId === 'string' && projectId
-        ? getWorkspaceProjectByProjectId(db, projectId)
-        : null;
+    const skillResourceScope = skillCatalogScope ?? (
+      projectWorkspaceId
+        ? {
+            workspaceId: projectWorkspaceId,
+            workspaceMemberId: projectCreatorMemberId || null,
+          }
+        : null
+    );
     let allSkillsPromise: ReturnType<typeof listAllSkillLikeEntries> | null = null;
     const loadAllSkills = async () => {
-      allSkillsPromise ??= projectResourceScope?.workspaceId
-        ? listAllSkillLikeEntries({
-            workspaceId: String(projectResourceScope.workspaceId),
-            workspaceMemberId:
-              typeof projectResourceScope.createdByWorkspaceMemberId === 'string'
-                ? projectResourceScope.createdByWorkspaceMemberId
-                : null,
-          })
+      allSkillsPromise ??= skillResourceScope
+        ? listAllSkillLikeEntries(skillResourceScope)
         : listAllSkillLikeEntries();
       return await allSkillsPromise;
     };
@@ -8681,23 +8786,83 @@ export async function startServer({
     let designSystemComponentsManifest;
     let designSystemFixtureHtml;
     let designSystemPullIndex;
+    let designSystemIntentIndex;
+    let designSystemRuntimeIssue;
     let designSystemImportMode;
     let designSystemCraftApplies = [];
     let designSystemCraftExemptions = [];
     let activeDesignSystemId = null;
     let designSystemDigest = null;
     if (effectiveDesignSystemId) {
-      const designSystemListOptions = projectWorkspaceId
-        ? {
-            workspaceId: projectWorkspaceId,
-            workspaceMemberId: projectCreatorMemberId || null,
-          }
-        : {};
+      const userDesignSystem = effectiveDesignSystemId.startsWith('user:');
+      // A run with a captured scope must resolve that exact resource even if
+      // the project was later rebound. A legacy, unbound run without a
+      // catalog provenance remains local. Projects created during Workspace
+      // identity transitions intentionally use their immutable local catalog
+      // provenance instead: it identifies a local record, not Workspace
+      // membership or billing authority.
+      const localCatalogDesignSystemRun =
+        designSystemScope?.kind === 'local' && Boolean(designSystemCatalogScope);
+      const usePinnedDesignSystemScope = userDesignSystem
+        && !localCatalogDesignSystemRun
+        && (
+          designSystemScope !== null && designSystemScope !== undefined
+          || (!designSystemCatalogScope && !projectWorkspaceId)
+        );
+      const effectivePinnedScope = usePinnedDesignSystemScope
+        ? designSystemScope
+          ?? (
+            !projectWorkspaceId
+              ? {
+                  schemaVersion: 1,
+                  kind: 'local',
+                  projectId: typeof projectId === 'string' ? projectId : '',
+                  designSystemId: effectiveDesignSystemId,
+                }
+              : null
+          )
+        : null;
+      const pinnedResolution = usePinnedDesignSystemScope
+        ? resolvePinnedRunDesignSystemScope({
+            db,
+            scope: effectivePinnedScope,
+            designSystemId: effectiveDesignSystemId,
+            userRoot: USER_DESIGN_SYSTEMS_DIR,
+          })
+        : null;
+      const designSystemListOptions = usePinnedDesignSystemScope
+        ? pinnedResolution?.ok && pinnedResolution.visibility === 'team'
+          ? {
+              workspaceId: pinnedResolution.workspaceId,
+              workspaceMemberId: pinnedResolution.workspaceMemberId,
+              exactTeam: true,
+            }
+          : pinnedResolution?.ok && pinnedResolution.visibility === 'personal'
+            ? {
+                workspaceId: pinnedResolution.workspaceId,
+                workspaceMemberId: pinnedResolution.workspaceMemberId,
+                exactPersonal: true,
+              }
+            : {}
+        : designSystemWorkspaceId
+          ? {
+              workspaceId: designSystemWorkspaceId,
+              workspaceMemberId: designSystemMemberId || null,
+            }
+          : {};
+      const designSystemVisibleForRun = (system) => {
+        if (!usePinnedDesignSystemScope) return designSystemVisibleToRun(system);
+        if (system?.source === 'built-in') return true;
+        if (!pinnedResolution?.ok) return false;
+        return pinnedResolution.visibility === 'team'
+          ? system.teamSynced === true
+          : system.teamSynced !== true;
+      };
       let systems = await listAllDesignSystems(designSystemListOptions);
       let summary = systems.find(
         (system) =>
           system.id === effectiveDesignSystemId
-          && designSystemVisibleToRun(system),
+          && designSystemVisibleForRun(system),
       );
       if (summary?.source === 'user' && summary.teamSynced !== true) {
         await ensureUserDesignSystemWorkspaceProject(db, effectiveDesignSystemId);
@@ -8705,7 +8870,7 @@ export async function startServer({
         summary = systems.find(
           (system) =>
             system.id === effectiveDesignSystemId
-            && designSystemVisibleToRun(system),
+            && designSystemVisibleForRun(system),
         );
       }
       const editingOwnDraftDesignSystem =
@@ -8731,18 +8896,36 @@ export async function startServer({
         // from real disk fixtures (see `tests/design-system-assets.test.ts`).
         const resourceBinding = projectDesignSystemBinding(summary);
         const scopedUserDesignSystemsRoot =
-          projectWorkspaceId && resourceBinding?.visibility === 'team'
-            ? teamResourceWorkspaceRoot(USER_DESIGN_SYSTEMS_DIR, projectWorkspaceId)
-            : USER_DESIGN_SYSTEMS_DIR;
+          usePinnedDesignSystemScope && pinnedResolution?.ok
+            ? pinnedResolution.root
+            : designSystemWorkspaceId && resourceBinding?.visibility === 'team'
+              ? teamResourceWorkspaceRoot(USER_DESIGN_SYSTEMS_DIR, designSystemWorkspaceId)
+              : USER_DESIGN_SYSTEMS_DIR;
         const assets = await resolveDesignSystemAssets(
+          effectiveDesignSystemId,
+          DESIGN_SYSTEMS_DIR,
+          scopedUserDesignSystemsRoot,
+        );
+        const runtimePromptContext = await resolveDesignSystemRuntimePromptContext(
           effectiveDesignSystemId,
           DESIGN_SYSTEMS_DIR,
           scopedUserDesignSystemsRoot,
         );
         designSystemUsageMd = assets.usageMd;
         designSystemTokensCss = assets.tokensCss;
-        designSystemComponentsManifest = assets.componentsManifest;
-        designSystemFixtureHtml = assets.fixtureHtml;
+        // A package has exactly one component-selection authority. Legacy
+        // packages keep the derived manifest / fixture prompt path. Once a
+        // package declares the structured runtime, valid or not, that legacy
+        // evidence must not compete with the intent resolver or mask a broken
+        // runtime as a usable component map.
+        if (runtimePromptContext.mode === 'legacy') {
+          designSystemComponentsManifest = assets.componentsManifest;
+          designSystemFixtureHtml = assets.fixtureHtml;
+        } else if (runtimePromptContext.mode === 'structured') {
+          designSystemIntentIndex = runtimePromptContext.intentIndex;
+        } else {
+          designSystemRuntimeIssue = runtimePromptContext.issue;
+        }
         designSystemPullIndex = assets.pullIndex;
         designSystemImportMode = assets.importMode;
         designSystemCraftApplies = Array.isArray(assets.craftApplies) ? assets.craftApplies : [];
@@ -8758,6 +8941,8 @@ export async function startServer({
             componentsManifest: designSystemComponentsManifest,
             fixtureHtml: designSystemFixtureHtml,
             pullIndex: designSystemPullIndex,
+            intentIndex: designSystemIntentIndex,
+            runtimeIssue: designSystemRuntimeIssue,
             importMode: designSystemImportMode,
           });
         }
@@ -8946,6 +9131,8 @@ export async function startServer({
       designSystemComponentsManifest,
       designSystemFixtureHtml,
       designSystemPullIndex,
+      designSystemIntentIndex,
+      designSystemRuntimeIssue,
       designSystemImportMode,
       craftBody,
       craftSections,
@@ -9155,13 +9342,49 @@ export async function startServer({
     // step. HTTP-created runs already carry the scope captured by the request
     // authorization transaction. Internal runs pin here. Retries reuse the
     // existing property and therefore never consult a later project rebind.
+    let runScopeChanged = false;
     if (!Object.prototype.hasOwnProperty.call(run, 'workspaceScope')) {
       run.workspaceScope =
         typeof projectId === 'string' && projectId
           ? pinRunWorkspaceScopeForProject(db, projectId)
           : null;
-      design.runs.persistState(run);
+      runScopeChanged = true;
     }
+    if (!Object.prototype.hasOwnProperty.call(run, 'designSystemScope')) {
+      const scopeProject =
+        typeof projectId === 'string' && projectId
+          ? getProject(db, projectId)
+          : null;
+      let scopePluginDesignSystemId = null;
+      if (run?.appliedPluginSnapshotId) {
+        try {
+          scopePluginDesignSystemId = designSystemIdFromPluginSnapshot(
+            getSnapshot(db, run.appliedPluginSnapshotId),
+          );
+        } catch {
+          scopePluginDesignSystemId = null;
+        }
+      }
+      const scopeSelection = scopeProject?.metadata?.intent === 'web-clone'
+        ? { id: null }
+        : resolveEffectiveDesignSystemSelection({
+            requestDesignSystemId: designSystemId,
+            pluginDesignSystemId: scopePluginDesignSystemId,
+            projectDesignSystemId: scopeProject?.designSystemId,
+            allowAppDefault: false,
+          });
+      run.designSystemScope =
+        typeof projectId === 'string' && projectId
+          ? pinRunDesignSystemScope({
+              db,
+              projectId,
+              designSystemId: scopeSelection.id,
+              workspaceScope: run.workspaceScope,
+            })
+          : null;
+      runScopeChanged = true;
+    }
+    if (runScopeChanged) design.runs.persistState(run);
     // Stash the original user prompt + per-turn config so the
     // langfuse-bridge report path can include them without reaching back
     // into chatBody across the createChatRunService boundary. Each field
@@ -9388,12 +9611,29 @@ export async function startServer({
         };
       }
     }
+    const toolWorkspaceId = typeof run.workspaceScope?.workspaceId === 'string'
+      ? run.workspaceScope.workspaceId.trim()
+      : '';
+    const toolWorkspaceMemberId =
+      typeof run.workspaceScope?.workspaceMemberId === 'string'
+        ? run.workspaceScope.workspaceMemberId.trim()
+        : '';
+    const inactivityTimeoutMs = resolveChatRunInactivityTimeoutMs(def.inactivityTimeoutMs);
+    const toolTokenTtlMs = resolveChatToolTokenTtlMs(inactivityTimeoutMs);
     const toolTokenGrant = cwd && typeof projectId === 'string' && projectId
       ? toolTokenRegistry.mint({
           runId,
           projectId,
+          ...(toolWorkspaceId ? { workspaceId: toolWorkspaceId } : {}),
+          ...(toolWorkspaceMemberId
+            ? { workspaceMemberId: toolWorkspaceMemberId }
+            : {}),
+          ...(run.designSystemScope
+            ? { designSystemScope: run.designSystemScope }
+            : {}),
           allowedEndpoints: CHAT_TOOL_ENDPOINTS,
           allowedOperations: CHAT_TOOL_OPERATIONS,
+          ttlMs: toolTokenTtlMs,
           ...(pluginGrantContext ?? {}),
         })
       : null;
@@ -9557,6 +9797,8 @@ export async function startServer({
         freeformDeckSignal: intentSignals.deck,
         mediaHintSignal: intentSignals.media,
         platformHintSignal: intentSignals.platform,
+        workspaceScope: run.workspaceScope,
+        designSystemScope: run.designSystemScope,
       });
 
     run.designSystemId = designSystemSelection?.id ?? null;
@@ -9621,7 +9863,13 @@ export async function startServer({
     // not the user's artifacts — those fall back to the tool-stream count.
     if (run?.id && cwd) {
       try {
-        runArtifactBaselines.remember(run.id, cwd, snapshotProjectArtifacts(cwd));
+        const before = await snapshotProjectArtifactsAsync(cwd);
+        // Async I/O lets cancellation/finalization interleave with the scan.
+        // In that case onFinalize already recorded the fallback outcome, so
+        // do not leave a stale baseline behind for a completed run.
+        if (!run.artifactOutcome && !design.runs.isTerminal(run.status)) {
+          runArtifactBaselines.remember(run.id, cwd, before);
+        }
       } catch {
         // Snapshotting is best-effort; finish falls back to the tool-stream count.
       }
@@ -9654,7 +9902,7 @@ export async function startServer({
             : null;
       return requestPrompt ? { prompt: requestPrompt, promptSource: 'message' as const } : { prompt: null };
     };
-    const resolveRunArtifactOutcomeBeforeFinish = () => {
+    const resolveRunArtifactOutcomeBeforeFinish = (afterSnapshot?: ReturnType<typeof snapshotProjectArtifacts>) => {
       if (!run?.id) return null;
       if (run.artifactOutcome) return run.artifactOutcome;
 
@@ -9671,7 +9919,7 @@ export async function startServer({
         try {
           const diff = diffRunArtifacts(
             artifactBaseline.before,
-            snapshotProjectArtifacts(artifactBaseline.cwd),
+            afterSnapshot ?? snapshotProjectArtifacts(artifactBaseline.cwd),
           );
           outcome = {
             artifactCount: diff.touched,
@@ -9699,6 +9947,18 @@ export async function startServer({
       run.artifactOutcome = outcome;
       return outcome;
     };
+    const resolveRunArtifactOutcomeBeforeFinishAsync = async () => {
+      if (!run?.id || run.artifactOutcome) return resolveRunArtifactOutcomeBeforeFinish();
+      const artifactBaseline = runArtifactBaselines.peek(run.id);
+      if (!artifactBaseline || artifactBaseline.contended) {
+        return resolveRunArtifactOutcomeBeforeFinish();
+      }
+      // Keep the baseline registered until the async read completes. A direct
+      // cancellation may finalize synchronously in the meantime; the resolver
+      // below then observes run.artifactOutcome and discards this late result.
+      const afterSnapshot = await snapshotProjectArtifactsAsync(artifactBaseline.cwd);
+      return resolveRunArtifactOutcomeBeforeFinish(afterSnapshot);
+    };
     const snapshotAiHtmlVersionsBeforeSuccess = async () => {
       const origin = artifactOriginForRun({
         runId: run.id,
@@ -9710,7 +9970,7 @@ export async function startServer({
         run.artifactOriginStatus = 'missing_version';
         run.artifactVersionId = undefined;
       }
-      const outcome = resolveRunArtifactOutcomeBeforeFinish();
+      const outcome = await resolveRunArtifactOutcomeBeforeFinishAsync();
       if (!outcome?.diff || !outcome.projectRoot || !run.projectId) return;
       const promptInfo = latestRunPromptForHtmlVersionSnapshot();
       const result = await snapshotAiHtmlVersionsForRun({
@@ -11250,7 +11510,6 @@ export async function startServer({
     // here; on this branch `send` was hoisted into the AMR preflight
     // earlier, so we keep only the new `runStartTimeMs` declaration.
     const runStartTimeMs = Date.now();
-    const inactivityTimeoutMs = resolveChatRunInactivityTimeoutMs(def.inactivityTimeoutMs);
     const firstOutputTimeoutMs =
       resolveChatRunFirstOutputTimeoutMs(def.firstOutputTimeoutMs);
     const artifactQuietPeriodMs = resolveChatRunArtifactQuietPeriodMs();
@@ -11470,6 +11729,9 @@ export async function startServer({
       // E-lite: stamp the last-activity clock BEFORE the disabled-watchdog bail
       // so `last_progress_age_ms` is recorded even when the watchdog is off.
       run.lastAgentActivityAt = Date.now();
+      if (toolTokenGrant) {
+        toolTokenRegistry.refreshToken(toolTokenGrant.token, { ttlMs: toolTokenTtlMs });
+      }
       const delay = activeInactivityTimeoutMs();
       if (delay <= 0) return;
       clearInactivityWatchdog();
@@ -13068,6 +13330,29 @@ export async function startServer({
           runArtifactSideEffects.artifactWriteSeen ||
           runArtifactSideEffects.liveArtifactSeen,
       });
+      // Codex reports shell failures as ordinary command_execution items and
+      // can still close the overall turn with code 0. For a structured DS run,
+      // a failed read/resolve/validate wrapper followed by zero artifacts is a
+      // failed delivery, not a successful text-only turn. Resolve the
+      // filesystem diff before finalizing so the run cannot surface as green
+      // merely because the agent explained why it stopped. A later successful
+      // retry that produced an artifact remains a normal success.
+      if (
+        status === 'succeeded'
+        && runHadFailedDesignSystemWrapper(run.events)
+        && !emittedRenderableQuestionForm(clarifyingQuestionText)
+      ) {
+        const artifactOutcome = await resolveRunArtifactOutcomeBeforeFinishAsync();
+        if (!artifactOutcome || artifactOutcome.artifactCount <= 0) {
+          markRpcCloseReason('design_system_wrapper_failed');
+          send('error', createSseErrorPayload(
+            'AGENT_EXECUTION_FAILED',
+            'The agent could not access the active design-system runtime and produced no deliverable. Retry after checking the local agent tool environment.',
+            { retryable: true },
+          ));
+          return finishWithRetryDecision('failed', code, signal);
+        }
+      }
       // Skip the close-handler failure emit when the run is already
       // terminal: the inactivity watchdog (failForInactivity) finishes the
       // run — sending its error and clearing run.clients/eventsLogStream —
@@ -14156,7 +14441,7 @@ export async function startServer({
     telemetry: { reportFinalizedMessage, reportFeedback },
   });
 
-  registerStaticSpaFallback(app, STATIC_DIR);
+  registerStaticSpaFallback(app, staticDir);
 
   // Wait for `listen` to bind so callers always see the resolved URL —
   // critical when port=0 (ephemeral port) and when the embedding sidecar

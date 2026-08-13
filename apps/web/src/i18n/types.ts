@@ -88,6 +88,7 @@ export interface Dict {
   'workspaceInvite.confirm': string;
   'workspaceInvite.submitFailed': string;
   'workspaceInvite.errorAlreadyMember': string;
+  'workspaceInvite.errorPendingInvite': string;
   'workspaceInvite.errorNoSession': string;
   'workspaceInvite.errorNoWorkspace': string;
   'workspaceInvite.errorUnreachable': string;
@@ -1250,6 +1251,10 @@ export interface Dict {
   'entry.navTeamSection': string;
   'entry.teamSlotNote': string;
   'entry.cloudCalloutTitle': string;
+  'entry.cloudRecovering': string;
+  'entry.authExpiredBody': string;
+  'home.createFailed': string;
+  'home.daemonRecovering': string;
   'entry.cloudCalloutBody': string;
   'entry.cloudCalloutDismissAria': string;
   'entry.workspaceLockedNote': string;
@@ -4579,6 +4584,7 @@ export interface Dict {
   'pet.slashPopoverTitle': string;
   'pet.slashPopoverHint': string;
   'pet.slashPet': string;
+  'pet.slashMcp': string;
   'pet.slashPetWake': string;
   'pet.slashPetTuck': string;
   'pet.slashHatch': string;
