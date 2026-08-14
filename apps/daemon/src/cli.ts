@@ -337,6 +337,8 @@ const BRAND_STRING_FLAGS = new Set([
 const BRAND_BOOLEAN_FLAGS = new Set([
   'help', 'h', 'json',
 ]);
+const AGENT_STRING_FLAGS = new Set(['daemon-url']);
+const AGENT_BOOLEAN_FLAGS = new Set(['help', 'h', 'json']);
 // Hoisted because `runAutomation` is reachable through the top-of-file
 // SUBCOMMAND_MAP dispatch, which runs during module evaluation —
 // any `const` declared further down would still be in TDZ when
@@ -371,6 +373,7 @@ const PLUGIN_LIST_BOOLEAN_FLAGS = new Set([
 ]);
 
 const SUBCOMMAND_MAP = {
+  agent: runAgent,
   artifacts: runArtifacts,
   media: runMedia,
   mcp: runMcp,
@@ -413,6 +416,57 @@ const SUBCOMMAND_MAP = {
   figma: runFigma,
 };
 
+function printAgentHelp() {
+  console.log(`Usage: od agent setup deepseek-harness [options]
+
+Install or repair Open Design's bundled connection component in the user's
+official DeepSeek Harness installation. The dsh CLI itself is not installed
+or upgraded by Open Design.
+
+Options:
+  --json                  Print a machine-readable result.
+  --daemon-url <url>      Override daemon URL.`);
+}
+
+async function runAgent(args) {
+  let flags;
+  try {
+    flags = parseFlags(args, { string: AGENT_STRING_FLAGS, boolean: AGENT_BOOLEAN_FLAGS });
+  } catch (error) {
+    console.error(error.message);
+    process.exit(2);
+  }
+  const positional = positionalArgs(args, AGENT_STRING_FLAGS);
+  if (flags.help || flags.h || positional[0] === 'help') {
+    printAgentHelp();
+    return;
+  }
+  if (positional[0] !== 'setup' || positional[1] !== 'deepseek-harness') {
+    printAgentHelp();
+    process.exit(2);
+  }
+  const base = await cliDaemonBaseUrl(flags);
+  let response;
+  try {
+    response = await fetch(`${base}/api/agents/deepseek-harness/companion/install`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+  } catch (error) {
+    surfaceFetchError(error, base);
+    process.exit(3);
+  }
+  if (!response.ok) return structuredHttpFailure(response, 'daemon-not-running');
+  const result = await response.json();
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  const verb = result.action === 'already-compatible' ? 'already compatible' : result.action;
+  console.log(`DeepSeek Harness connection component ${verb} (${result.packageVersion}).`);
+}
+
 const EXPORT_STRING_FLAGS = new Set([
   'daemon-url', 'project', 'format', 'out', 'output', 'image-format', 'title', 'file',
   'workspace', 'workspace-member',
@@ -425,10 +479,9 @@ function printExportHelp() {
   console.log(`Usage:
   od export <file> --project <id> --format <fmt> [options]
 
-Programmatic export of an HTML/deck artifact to PDF, image, or PPTX. Runs
-entirely from the rendered design (no model/agent calls). Rasterization uses
-the desktop runtime's bundled Chromium, so a desktop/packaged runtime must be
-reachable; otherwise the command reports that the renderer is unavailable.
+Programmatic export of an HTML/deck artifact to standalone HTML, PDF, image,
+or PPTX. Runs without model/agent calls. Standalone HTML works in a headless
+daemon; visual formats require the desktop runtime's bundled Chromium.
 
 Formats:  ${EXPORT_FORMATS.join(', ')}
 
@@ -447,6 +500,7 @@ Options:
 
 Examples:
   od export index.html --project p1 --format pdf --out page.pdf
+  od export index.html --project p1 --format html --out standalone.html
   od export slide.html --project p1 --format image --image-format png --out slide.png
   od export deck.html --project p1 --format pptx --out deck.pptx`);
 }
@@ -488,7 +542,7 @@ async function runExport(args) {
   const requestHeaders = token
     ? { authorization: `Bearer ${token}` }
     : workspaceHeadersFromExplicitFlags(flags) ?? {};
-  // All three formats rasterize through the desktop screenshot renderer so the
+  // Visual formats rasterize through the desktop screenshot renderer so the
   // CLI matches the UI exactly. In particular `pdf` uses `/export/pdf-image`
   // (one raster page per deck slide / per viewport for a page) — NOT the generic
   // `/export` vector `printToPDF` path, which drops CJK glyphs in the packaged
@@ -539,7 +593,7 @@ async function runExport(args) {
     if (!out) {
       const ext = format === 'image'
         ? (flags['image-format'] === 'jpeg' ? 'jpg' : 'png')
-        : format === 'pptx' ? 'pptx' : 'pdf';
+        : format === 'pptx' ? 'pptx' : format === 'html' ? 'html' : 'pdf';
       out = `artifact.${ext}`;
     }
   }
@@ -747,8 +801,8 @@ function printRootHelp() {
       into a zip for support tickets. Same output as Settings → About →
       Export diagnostics.
 
-  od export <file> --project <id> --format <pdf|image|pptx> [--out <path>]
-      Programmatically export an HTML/deck artifact to PDF, image, or PPTX
+  od export <file> --project <id> --format <html|pdf|image|pptx> [--out <path>]
+      Programmatically export an HTML/deck artifact to HTML, PDF, image, or PPTX
       (no model/agent calls). Mirrors the web Download menu; rasterization uses
       the desktop runtime's bundled Chromium.
 
