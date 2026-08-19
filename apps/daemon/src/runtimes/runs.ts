@@ -203,6 +203,8 @@ function summarizeAssistantMessageEvents(events) {
   let upstreamErrorCount = 0;
   let provider;
   let model;
+  let usageProvider;
+  let usageModel;
   let fallbackOrdinal = 0;
   const countErrorClass = (value) => {
     if (value === 'rate_limited') rateLimitedCount += 1;
@@ -212,6 +214,15 @@ function summarizeAssistantMessageEvents(events) {
   for (const record of events) {
     if (record?.event !== 'agent' || !record.data || typeof record.data !== 'object') continue;
     const data = record.data;
+    if (data.type === 'usage') {
+      if (typeof data.provider === 'string' && data.provider.trim()) {
+        usageProvider = data.provider.trim();
+      }
+      if (typeof data.model === 'string' && data.model.trim()) {
+        usageModel = data.model.trim();
+      }
+      continue;
+    }
     if (data.type !== 'diagnostic') continue;
     if (data.name === 'model_retry') {
       retryCount += 1;
@@ -282,8 +293,8 @@ function summarizeAssistantMessageEvents(events) {
     rateLimitedCount,
     timeoutCount,
     upstreamErrorCount,
-    provider,
-    model,
+    provider: provider ?? usageProvider,
+    model: model ?? usageModel,
   };
 }
 
@@ -536,9 +547,6 @@ function durableRunState(run) {
       : {}),
     ...(typeof run.clientType === 'string' ? { clientType: run.clientType } : {}),
     ...(run.workspaceScope !== undefined ? { workspaceScope: run.workspaceScope } : {}),
-    ...(run.designSystemScope !== undefined
-      ? { designSystemScope: run.designSystemScope }
-      : {}),
     ...(run.analyticsTelemetry ? { analyticsTelemetry: run.analyticsTelemetry } : {}),
     ...(run.promptTelemetry ? { promptTelemetry: run.promptTelemetry } : {}),
     ...(run.promptCache ? { promptCache: run.promptCache } : {}),
@@ -876,9 +884,6 @@ export function createChatRunService({
     };
     if (Object.prototype.hasOwnProperty.call(meta, 'workspaceScope')) {
       run.workspaceScope = meta.workspaceScope ?? null;
-    }
-    if (Object.prototype.hasOwnProperty.call(meta, 'designSystemScope')) {
-      run.designSystemScope = meta.designSystemScope ?? null;
     }
     runs.set(run.id, run);
     if (run.clientRequestId) runIdsByClientRequestId.set(run.clientRequestId, run.id);
