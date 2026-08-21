@@ -39,12 +39,9 @@ import {
   trackOnboardingCompleteResult,
   trackOnboardingRuntimeScanResult,
   trackPageView,
-  trackDeepSeekCampaignBadgeClick,
-  trackDeepSeekCampaignBadgeSurfaceView,
 } from '../analytics/events';
 import {
   amrHandoffDeviceId,
-  attributedAmrUrl,
   recordAmrEntry,
   type AmrEntryAttribution,
 } from '../analytics/amr-attribution';
@@ -137,7 +134,11 @@ import type { OnboardingEntry } from '../onboarding/onboarding-entry';
 import type { PluginUseAction } from './plugins-home/useActions';
 import { Icon } from './Icon';
 import { Button } from '@open-design/components';
-import { defaultAgentModelId, effectiveAgentModelChoice } from './agentModelSelection';
+import {
+  defaultAgentModelId,
+  effectiveAgentModelChoice,
+  effectiveAgentModelId,
+} from './agentModelSelection';
 import { AgentIcon } from './AgentIcon';
 import { CommunityView } from './CommunityView';
 import { TeamSlotPlaceholder } from './TeamSlotPlaceholder';
@@ -158,11 +159,10 @@ import { resolvePlanLabelTier } from '../collab/team-plan';
 import { resolveDeepSeekV4FlashCampaignAudience } from '../campaigns/deepseek-v4-flash';
 import { useDeepSeekV4FlashCampaignVisibility } from '../campaigns/use-deepseek-v4-flash-campaign';
 import {
-  GO_PLAN_PRICING_URL,
   resolveSubscriptionAudience,
 } from '../campaigns/go-plan';
 import { useGoPlanCampaignVisibility } from '../campaigns/use-go-plan-campaign';
-import { getGoPlanCampaignCopy } from '../campaigns/go-plan-content';
+import { WorkbenchCampaignBadge } from './WorkbenchCampaignBadge';
 import {
   beginWorkspaceScopedRead,
   workspaceIdentityCacheKey,
@@ -611,8 +611,7 @@ export function EntryShell({
   onAmrLoginStatusChange,
   artifactUpgradeSlot,
 }: Props) {
-  const { locale, t } = useI18n();
-  const goPlanCopy = getGoPlanCampaignCopy(locale);
+  const { t } = useI18n();
   // Each entry sub-view (home / projects / design-systems) is its own
   // URL now, so the browser back/forward buttons work and a deep link
   // to /design-systems lands on that section. We derive the active
@@ -704,7 +703,9 @@ export function EntryShell({
         : 'unknown';
   const topRightCampaignKind =
     subscriptionAudience === 'unpaid'
-      ? 'go'
+      ? goPlanCampaignVisibility.visible
+        ? 'go'
+        : null
       : deepSeekV4FlashCampaignAudience === 'paid'
         ? 'deepseek'
         : null;
@@ -1189,62 +1190,6 @@ export function EntryShell({
     scrollContainer.scrollTop = 0;
   }, [view]);
   const analytics = useAnalytics();
-  useEffect(() => {
-    if (view !== 'home' || !topRightCampaignKind) return;
-    const go = topRightCampaignKind === 'go';
-    if (go) return;
-    trackDeepSeekCampaignBadgeSurfaceView(analytics.track, {
-      page_name: 'home',
-      area: 'campaign_badge',
-      element: 'deepseek_v4_pro',
-      campaign_id: 'deepseek_v4_pro',
-      user_state: 'paid',
-    });
-  }, [analytics.track, topRightCampaignKind, view]);
-  const openCampaignPricing = useCallback(() => {
-    if (!topRightCampaignKind) return;
-    const go = topRightCampaignKind === 'go';
-    if (go) {
-      window.open(GO_PLAN_PRICING_URL, '_blank', 'noopener,noreferrer');
-      return;
-    }
-    trackDeepSeekCampaignBadgeClick(analytics.track, {
-      page_name: 'home',
-      area: 'campaign_badge',
-      element: 'open_pricing',
-      campaign_id: 'deepseek_v4_pro',
-      user_state: 'paid',
-    });
-    const attribution = recordAmrEntry(
-      analytics.track,
-      'deepseek_workbench_badge',
-      new Date(),
-      {
-        metricsConsent: config.telemetry?.metrics === true,
-        campaignId: 'deepseek_v4_pro',
-        conversionSource: 'deepseek_workbench_badge',
-      },
-    );
-    const deviceId = amrHandoffDeviceId({
-      metricsConsent: config.telemetry?.metrics === true,
-      resolvedDeviceId: getResolvedDeviceId(),
-      installationId: config.installationId,
-    });
-    // Both campaign badges are lightweight discovery entries. Pricing owns
-    // comparison; only a concrete Pricing card hands checkout to Cloud.
-    const destination = GO_PLAN_PRICING_URL;
-    window.open(
-      attributedAmrUrl(destination, attribution, deviceId),
-      '_blank',
-      'noopener,noreferrer',
-    );
-  }, [
-    analytics.track,
-    config.installationId,
-    config.telemetry?.metrics,
-    topRightCampaignKind,
-    workspaceContext?.workspaceId,
-  ]);
   // 产品拍板 D5: the campaign modal's paid 立即使用 performs the REAL switch —
   // daemon execution mode + Cloud agent (amr) + DeepSeek V4 Flash — through
   // the same persistence callbacks the InlineModelSwitcher writes through.
@@ -1407,6 +1352,10 @@ export function EntryShell({
     let amrGatePrecheckWitness: AmrBalanceGateScope | undefined;
     let amrGatePrecheckPassed = false;
     if (config.mode === 'daemon' && config.agentId === 'amr') {
+      const amrModelId = effectiveAgentModelId(
+        agents.find((agent) => agent.id === 'amr'),
+        config.agentModels?.amr,
+      );
       // PRODUCT INVARIANT: Send never starts Workspace identity discovery.
       // Billing consumes the shell's current in-memory snapshot; if it has not
       // arrived yet, the existing account-scoped gate is used. The daemon's
@@ -1423,7 +1372,7 @@ export function EntryShell({
         const gateWorkspaceIdentity = workspaceIdentityCacheKey(gateWorkspaceContext);
         const gateScope = amrBalanceGateScopeForWorkspaceContext(gateWorkspaceContext);
         let gate = await retryUnavailableAmrBalanceGate(
-          () => checkAmrBalanceGate(gateScope),
+          () => checkAmrBalanceGate(gateScope, amrModelId),
         );
         // Hard blocks hold THIS submit open: the dialog resolves 'retry' when
         // its blocking condition clears (sign-in completed, recharge landed)
@@ -1442,7 +1391,7 @@ export function EntryShell({
           setAmrBalanceGateBlock(null);
           if (decision === 'dismiss') return 'blocked' as const;
           gate = await retryUnavailableAmrBalanceGate(
-            () => checkAmrBalanceGate(gateScope),
+            () => checkAmrBalanceGate(gateScope, amrModelId),
           );
         }
         if (gate.kind === 'unavailable') return false;
@@ -1681,21 +1630,13 @@ export function EntryShell({
           onOpenSearch={() => setProjectSearchOpen(true)}
           open={railOpen}
           topRightSlot={
-            view === 'home' && topRightCampaignKind ? (
-              <button
-                type="button"
-                className="entry-deepseek-campaign-badge"
-                onClick={openCampaignPricing}
-                aria-label={topRightCampaignKind === 'go'
-                  ? goPlanCopy.workbenchBadgeAria
-                  : t('campaign.deepseekV4Flash.workbenchBadgeAria')}
-                data-testid="deepseek-campaign-pricing-badge"
-              >
-                <span>{topRightCampaignKind === 'go'
-                  ? goPlanCopy.workbenchBadge
-                  : t('campaign.deepseekV4Flash.workbenchBadge')}</span>
-                <Icon name="arrow-right" size={13} />
-              </button>
+            topRightCampaignKind ? (
+              <WorkbenchCampaignBadge
+                kind={topRightCampaignKind}
+                page="home"
+                metricsConsent={config.telemetry?.metrics === true}
+                installationId={config.installationId}
+              />
             ) : null
           }
           context={railWorkspaceContext}
@@ -1728,9 +1669,8 @@ export function EntryShell({
               lives in the rail footer, and everything below is fixed-position
               or portalled so it occupies no layout space here. */}
           <WhatsNewPopup active={view === 'home'} />
-          {/* DeepSeek campaign badge moved into EntryNavRail's top-right
-              cluster (topRightSlot above) so it sits beside the account
-              module in one flex row. */}
+          {/* The campaign badge lives in EntryNavRail's top-right cluster so it
+              stays beside the account module across every entry tab. */}
           {amrBalanceGateBlock ? (
             <AmrBalanceDialog
               reason={amrBalanceGateBlock.reason}

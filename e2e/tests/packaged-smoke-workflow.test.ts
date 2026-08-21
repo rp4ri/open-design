@@ -88,7 +88,7 @@ const releaseStableNotesScriptPath = join(workspaceRoot, ".github", "scripts", "
 const releaseStableScriptPath = join(workspaceRoot, "tools", "release", "src", "metadata", "prepare-stable.ts");
 const releaseBetaScriptPath = join(workspaceRoot, "tools", "release", "src", "metadata", "prepare-beta.ts");
 const packagedPackageJsonPath = join(workspaceRoot, "apps", "packaged", "package.json");
-const scopesScriptPath = join(workspaceRoot, "scripts", "scopes.ts");
+const scopesScriptPath = join(workspaceRoot, ".github", "scripts", "scopes.py");
 const runnersScriptPath = join(workspaceRoot, ".github", "scripts", "runners.py");
 const notifyDailyFeishuWorkflowPath = join(workspaceRoot, ".github", "workflows", "notify-daily-feishu.yml");
 const notifyReleaseFeishuWorkflowPath = join(workspaceRoot, ".github", "workflows", "notify-release-feishu.yml");
@@ -194,7 +194,7 @@ function extractValidateGateJqPrograms(workflow: string): { failures: string; re
   const needsCheck = sectionBetween(
     validate,
     "      - name: Check workspace validation jobs",
-    "      - name: Block merge while a merge-blocking label is present",
+    "      - name: Download pending hash map",
   );
   const programs = [...needsCheck.matchAll(/jq -r '([\s\S]*?)'/g)].map((match) => match[1] ?? "");
   expect(programs).toHaveLength(2);
@@ -253,39 +253,33 @@ async function readPackagedVersion(): Promise<string> {
 }
 
 async function runScopesPrint(eventName: string, eventPayload: unknown, changedFiles: string[] = []): Promise<Record<string, unknown>> {
-  const tempDir = await mkdtemp(join(tmpdir(), "od-scopes-"));
-  const eventPath = join(tempDir, "event.json");
-  const ghPath = join(tempDir, "gh");
-  const ghCmdPath = join(tempDir, "gh.cmd");
-  await writeFile(eventPath, JSON.stringify(eventPayload));
-  const script = `#!/usr/bin/env node
-const changedFiles = ${JSON.stringify(changedFiles)};
-if (process.argv.includes("--jq")) {
-  process.stdout.write(changedFiles.join("\\n"));
-  if (changedFiles.length > 0) process.stdout.write("\\n");
-} else {
-  process.stdout.write(JSON.stringify({ files: changedFiles.map((filename) => ({ filename })) }));
-}
-`;
-  await writeFile(ghPath, script);
-  await chmod(ghPath, 0o755);
-  await writeFile(ghCmdPath, `@echo off\r\n"${process.execPath}" "${ghPath}" %*\r\n`);
-
-  try {
-    const { stdout } = await execFileAsync(process.execPath, ["--experimental-strip-types", scopesScriptPath, "print"], {
-      cwd: workspaceRoot,
-      env: workflowFixtureEnv({
-        GITHUB_EVENT_NAME: eventName,
-        GITHUB_EVENT_PATH: eventPath,
-        GITHUB_REPOSITORY: "nexu-io/open-design",
-        GITHUB_SHA: "0123456789abcdef0123456789abcdef01234567",
-        OPEN_DESIGN_GH_NODE_SCRIPT: ghPath,
-      }, tempDir),
-    });
-    return JSON.parse(stdout) as Record<string, unknown>;
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  const inputMode = (eventPayload as { inputs?: { ci_mode?: string } }).inputs?.ci_mode;
+  const context =
+    eventName === "workflow_dispatch" && inputMode !== "hot"
+      ? "full"
+      : eventName === "merge_group" && changedFiles.length === 0
+        ? "full"
+        : eventName === "merge_group"
+          ? "merge-queue"
+          : "pr";
+  const { stdout } = await execFileAsync("python3", [scopesScriptPath, "plan", "--context", context, "--files", ...changedFiles], {
+    cwd: workspaceRoot,
+  });
+  const value = JSON.parse(stdout) as {
+    scopes: Record<string, unknown>;
+    enabled: Record<string, boolean>;
+  };
+  return {
+    ...value.scopes,
+    run_e2e_vitest: value.enabled.e2e_vitest,
+    run_playwright_critical: value.enabled.playwright_critical,
+    run_playwright_visual: value.enabled.playwright_visual,
+    run_preflight: value.enabled.preflight,
+    run_ui_p0: value.enabled.ui_p0,
+    run_web_workspace_tests: value.enabled.web_workspace_tests,
+    run_windows_tools_pack_payload_tests: value.enabled.windows_tools_pack_payload_tests,
+    run_workspace_unit_tests: value.enabled.workspace_unit_tests,
+  };
 }
 
 async function runRunners(mode?: string): Promise<Record<string, string>> {
@@ -407,18 +401,17 @@ describe("packaged smoke workflow", () => {
     expect(workflow).not.toContain("Smoke PR windows packaged runtime");
     expect(workflow).not.toContain("Smoke PR linux headless packaged runtime");
     expect(workflow).not.toContain("OD_PACKAGED_E2E_");
-    expect(workflow).not.toContain("actions/cache/save");
   });
 
-  it("[P2] runs Windows launcher payload archive validation when tools-pack is touched", async () => {
+  it("[P2] runs the independent Windows launcher payload test set", async () => {
     const workflow = await readFile(ciWorkflowPath, "utf8");
     const job = sectionBetween(workflow, "  windows_tools_pack_payload_tests:", "  web_workspace_tests:");
     const validate = sectionBetween(workflow, "  validate:", "          if [ -n \"$failures\" ]; then");
 
     expect(job).toContain("fromJSON(needs.runners.outputs.runs_on).windows_tools");
     expect(job).toContain("toJSON(fromJSON(needs.runners.outputs.runs_on).windows_tools)");
-    expect(job).toContain("needs.scopes.outputs.run_windows_tools_pack_payload_tests == 'true'");
-    expect(job).toContain("pnpm --filter @open-design/tools-pack exec vitest run tests/launcher-payload.test.ts");
+    expect(job).toContain("fromJSON(needs.plan.outputs.run).windows_tools_pack_payload_tests");
+    expect(job).toContain("pnpm --filter @open-design/tools-pack exec vitest run tests/launcher/windows/payload.test.ts");
     expect(validate).toContain("windows_tools_pack_payload_tests");
   });
 
@@ -540,13 +533,40 @@ describe("packaged smoke workflow", () => {
       readFile(commentWorkflowPath, "utf8"),
     ]);
 
-    // Producer: the merge_group gate emits a handoff/comment artifact for the labeled PR when
-    // it blocks, and uploads it on the failure path (the gate exits 1 exactly when it produces).
-    expect(ciWorkflow).toContain("<!-- merge-queue-needs-validation -->");
-    expect(ciWorkflow).toContain("emit_ejection_notice");
-    expect(ciWorkflow).toContain(
+    const mergePolicy = sectionBetween(ciWorkflow, "  merge_policy:", "  validate:");
+    const validate = sectionBetween(ciWorkflow, "  validate:", "  runtime_summary:");
+
+    // Producer: merge policy is a merge-group-only sibling of every workload. It emits a
+    // handoff/comment artifact for a labeled PR and uploads it on the failure path.
+    expect(mergePolicy).toContain("needs: [plan, runners]");
+    expect(mergePolicy).toContain("if: ${{ github.event_name == 'merge_group' }}");
+    expect(mergePolicy).toContain("fromJSON(needs.runners.outputs.runs_on).control");
+    expect(mergePolicy).toContain("<!-- merge-queue-needs-validation -->");
+    expect(mergePolicy).toContain("emit_ejection_notice");
+    expect(mergePolicy).toContain(
       "if: ${{ failure() && steps.merge_blocking_label_gate.outputs.comment_created == 'true' }}",
     );
+
+    // Policy converges only at the required workspace gate. It never becomes a prerequisite
+    // that could suppress workload coverage for a labeled merge group.
+    expect(validate).toContain("      - merge_policy");
+    expect(validate).toContain("if: ${{ always() }}");
+    expect(validate).not.toContain("Block merge while a merge-blocking label is present");
+    const workloadSections = [
+      ["  static_gate:", "  preflight:"],
+      ["  preflight:", "  workspace_unit_tests:"],
+      ["  workspace_unit_tests:", "  daemon_unit_tests:"],
+      ["  daemon_unit_tests:", "  windows_tools_pack_payload_tests:"],
+      ["  windows_tools_pack_payload_tests:", "  web_workspace_tests:"],
+      ["  web_workspace_tests:", "  e2e_vitest:"],
+      ["  e2e_vitest:", "  playwright_critical:"],
+      ["  playwright_critical:", "  ui_p0:"],
+      ["  ui_p0:", "  playwright_visual:"],
+      ["  playwright_visual:", "  merge_policy:"],
+    ] as const;
+    for (const [start, end] of workloadSections) {
+      expect(sectionBetween(ciWorkflow, start, end)).toContain("needs: [plan, runners]");
+    }
 
     // Consumer: a merge_group run's head_sha is the queue's synthetic merge commit, so the atom
     // binds merge_group artifacts to their producing run by run_id and skips the base-freshness
@@ -1075,15 +1095,14 @@ process.stdin.on("end", () => {
 
   it("[P2] keeps PR and merge queue CI separated by hot/full validation mode", async () => {
     const workflow = await readFile(ciWorkflowPath, "utf8");
-    const scopes = sectionBetween(workflow, "  scopes:", "  static_gate:");
+    const plan = sectionBetween(workflow, "  plan:", "  static_gate:");
     const validate = sectionBetween(workflow, "  validate:", "  runtime_summary:");
 
     expect(workflow).toContain("ci_mode:");
-    expect(scopes).toContain("ci_mode: ${{ steps.detect.outputs.ci_mode }}");
-    expect(scopes).toContain("ui_p0_validation_required: ${{ steps.detect.outputs.ui_p0_validation_required }}");
-    expect(scopes).toContain("run_ui_p0: ${{ steps.detect.outputs.run_ui_p0 }}");
-    expect(workflow).toContain("needs.scopes.outputs.run_ui_p0 == 'true'");
-    expect(validate).toContain('when($out.run_ui_p0 == "true"; ["ui_p0"])');
+    expect(plan).toContain("run: ${{ steps.hash.outputs.run }}");
+    expect(plan).toContain("scopes: ${{ steps.scopes.outputs.scopes }}");
+    expect(workflow).toContain("fromJSON(needs.plan.outputs.run).ui_p0");
+    expect(validate).toContain("[$run | to_entries[] | select(.value) | .key]");
 
     await expect(runScopesPrint("workflow_dispatch", { inputs: { ci_mode: "hot" } }, ["apps/web/src/app/page.tsx"])).resolves.toMatchObject({
       ci_mode: "hot",
@@ -1126,12 +1145,12 @@ process.stdin.on("end", () => {
     const workflow = await readFile(ciWorkflowPath, "utf8");
     const workspaceUnit = sectionBetween(workflow, "  workspace_unit_tests:", "  daemon_unit_tests:");
 
-    expect(workspaceUnit).toContain(`if [ "\${{ needs.scopes.outputs.tools_pack_tests_required }}" = "true" ]; then
+    expect(workspaceUnit).toContain(`if [ "\${{ fromJSON(needs.plan.outputs.scopes).tools_pack_tests_required }}" = "true" ]; then
             pnpm --filter @open-design/desktop build
             pnpm --filter @open-design/desktop test
             pnpm --filter @open-design/packaged test
             pnpm --filter @open-design/tools-pack test
-            if [ "\${{ needs.scopes.outputs.run_e2e_vitest }}" != "true" ]; then
+            if [ "\${{ fromJSON(needs.plan.outputs.run).e2e_vitest }}" != "true" ]; then
               pnpm --filter @open-design/e2e test tests/packaged-launcher-update-loop.test.ts
             fi
           fi`);
@@ -1142,12 +1161,12 @@ process.stdin.on("end", () => {
     const daemonTests = sectionBetween(workflow, "  daemon_unit_tests:", "  windows_tools_pack_payload_tests:");
     const validate = sectionBetween(workflow, "  validate:", "  runtime_summary:");
 
-    expect(daemonTests).toContain("if: ${{ needs.scopes.outputs.daemon_tests_required == 'true' }}");
+    expect(daemonTests).toContain("if: ${{ fromJSON(needs.plan.outputs.run).daemon_unit_tests }}");
     expect(daemonTests).toContain("fail-fast: false");
     expect(daemonTests).toContain("shard: [1, 2, 3, 4]");
     expect(daemonTests).toContain("pnpm --filter @open-design/daemon test --shard=${{ matrix.shard }}/4");
     expect(validate).toContain("- daemon_unit_tests");
-    expect(validate).toContain('when($out.daemon_tests_required == "true"; ["daemon_unit_tests"])');
+    expect(validate).toContain("[$run | to_entries[] | select(.value) | .key]");
   });
 
   it("[P2] skips the critical fallback for pure packaged-leaf changes and stays fail-closed elsewhere", async () => {
@@ -1183,10 +1202,28 @@ process.stdin.on("end", () => {
       run_playwright_visual: false,
       run_ui_p0: false,
       run_web_workspace_tests: false,
-      run_windows_tools_pack_payload_tests: true,
+      run_windows_tools_pack_payload_tests: false,
       tools_dev_tests_required: true,
       tools_pack_tests_required: true,
+      windows_tools_pack_payload_tests_required: false,
       workspace_validation_required: true,
+    });
+
+    await expect(runScopesPrint("merge_group", mergeGroup, ["tools/pack/src/mac/app.ts"])).resolves.toMatchObject({
+      run_windows_tools_pack_payload_tests: false,
+      tools_pack_tests_required: true,
+      windows_tools_pack_payload_tests_required: false,
+    });
+
+    await expect(runScopesPrint("merge_group", mergeGroup, ["tools/pack/src/win/custom-installer.ts"])).resolves.toMatchObject({
+      run_windows_tools_pack_payload_tests: true,
+      tools_pack_tests_required: true,
+      windows_tools_pack_payload_tests_required: true,
+    });
+
+    await expect(runScopesPrint("merge_group", mergeGroup, ["packages/launcher-proto/src/index.ts"])).resolves.toMatchObject({
+      run_windows_tools_pack_payload_tests: true,
+      windows_tools_pack_payload_tests_required: true,
     });
 
     await expect(runScopesPrint("merge_group", mergeGroup, ["apps/desktop/package.json"])).resolves.toMatchObject({
@@ -1262,30 +1299,77 @@ process.stdin.on("end", () => {
     expect(validate).not.toContain("run_docker_build");
     expect(validate).toContain("Check workspace validation jobs");
 
-    const baseOutputs = {
-      run_preflight: "false",
-      run_workspace_unit_tests: "false",
-      run_windows_tools_pack_payload_tests: "false",
-      run_web_workspace_tests: "false",
-      run_e2e_vitest: "false",
-      run_playwright_critical: "false",
-      run_ui_p0: "false",
-      run_playwright_visual: "false",
+    const baseRun = {
+      static_gate: false,
+      preflight: false,
+      workspace_unit_tests: false,
+      daemon_unit_tests: false,
+      windows_tools_pack_payload_tests: false,
+      web_workspace_tests: false,
+      e2e_vitest: false,
+      playwright_critical: false,
+      ui_p0: false,
+      playwright_visual: false,
     };
     // Core gate only cares about app jobs — unknown packaging keys are ignored.
     await expect(
       validateGatePasses(workflow, {
-        scopes: { result: "success", outputs: baseOutputs },
-        static_gate: { result: "success" },
+        plan: { result: "success", outputs: { run: JSON.stringify(baseRun) } },
+        merge_policy: { result: "skipped" },
       }),
     ).resolves.toBe(true);
 
+    await expect(
+      validateGatePasses(workflow, {
+        plan: { result: "success", outputs: { run: JSON.stringify(baseRun) } },
+        merge_policy: { result: "success" },
+      }),
+    ).resolves.toBe(true);
+
+    await expect(
+      validateGatePasses(workflow, {
+        plan: { result: "success", outputs: { run: JSON.stringify(baseRun) } },
+        merge_policy: { result: "failure" },
+      }),
+    ).resolves.toBe(false);
+
     const needsWithFailedWeb = {
-      scopes: { result: "success", outputs: { ...baseOutputs, run_web_workspace_tests: "true" } },
-      static_gate: { result: "success" },
+      plan: { result: "success", outputs: { run: JSON.stringify({ ...baseRun, web_workspace_tests: true }) } },
       web_workspace_tests: { result: "failure" },
     };
     await expect(validateGatePasses(workflow, needsWithFailedWeb)).resolves.toBe(false);
+  });
+
+  it("[P1] publishes hash state only after the workspace gate succeeds", async () => {
+    const workflow = await readFile(ciWorkflowPath, "utf8");
+    const plan = sectionBetween(workflow, "  plan:", "  static_gate:");
+    const validate = sectionBetween(workflow, "  validate:", "  runtime_summary:");
+
+    expect(plan).toContain("Upload pending hash map");
+    expect(plan).not.toContain("actions/cache/save");
+    expect(validate).toContain("Download pending hash map");
+    expect(validate).toContain("Save successful hash map");
+    expect(validate.indexOf("Save successful hash map")).toBeGreaterThan(
+      validate.indexOf("Check workspace validation jobs"),
+    );
+    expect(validate).not.toContain("Block merge while a merge-blocking label is present");
+
+    const run = {
+      static_gate: false,
+      preflight: false,
+      workspace_unit_tests: false,
+      daemon_unit_tests: false,
+      windows_tools_pack_payload_tests: false,
+      web_workspace_tests: false,
+      e2e_vitest: true,
+      playwright_critical: false,
+      ui_p0: false,
+      playwright_visual: false,
+    };
+    await expect(validateGatePasses(workflow, {
+      plan: { result: "success", outputs: { run: JSON.stringify(run) } },
+      e2e_vitest: { result: "failure" },
+    })).resolves.toBe(false);
   });
 
   it("[P1] includes launcher protocol in the Nix daemon workspace build", async () => {
@@ -1300,8 +1384,8 @@ process.stdin.on("end", () => {
 
   it("[P2] routes trusted Linux CI through the Nexu runner fleet", async () => {
     const workflow = await readFile(ciWorkflowPath, "utf8");
-    const runners = sectionBetween(workflow, "  runners:", "  scopes:");
-    const scopes = sectionBetween(workflow, "  scopes:", "  static_gate:");
+    const runners = sectionBetween(workflow, "  runners:", "  plan:");
+    const plan = sectionBetween(workflow, "  plan:", "  static_gate:");
     const staticGate = sectionBetween(workflow, "  static_gate:", "  preflight:");
     const workspaceUnitTests = sectionBetween(workflow, "  workspace_unit_tests:", "  daemon_unit_tests:");
     const daemonUnitTests = sectionBetween(workflow, "  daemon_unit_tests:", "  windows_tools_pack_payload_tests:");
@@ -1309,16 +1393,16 @@ process.stdin.on("end", () => {
     const e2eVitest = sectionBetween(workflow, "  e2e_vitest:", "  playwright_critical:");
     const preflight = sectionBetween(workflow, "  preflight:", "  workspace_unit_tests:");
     const uiP0 = sectionBetween(workflow, "  ui_p0:", "  playwright_visual:");
-    const visual = sectionBetween(workflow, "  playwright_visual:", "  validate:");
+    const visual = sectionBetween(workflow, "  playwright_visual:", "  merge_policy:");
 
     expect(runners).toContain("|| 'nexu-runners-small'");
     expect(runners).toContain("&& 'ubuntu-24.04'");
     expect(runners).toContain("runs_on: ${{ steps.runners.outputs.runs_on }}");
     expect(runners).toContain("decision: ${{ steps.runners.outputs.decision }}");
     expect(runners).toContain("python3 .github/scripts/runners.py");
-    expect(scopes).toContain("needs: [runners]");
-    expect(scopes).toContain("fromJSON(needs.runners.outputs.runs_on).control");
-    expect(staticGate).toContain("needs: [runners]");
+    expect(plan).toContain("needs: [runners]");
+    expect(plan).toContain("fromJSON(needs.runners.outputs.runs_on).control");
+    expect(staticGate).toContain("needs: [plan, runners]");
     expect(staticGate).toContain("fromJSON(needs.runners.outputs.runs_on).control");
     expect(workspaceUnitTests).toContain("fromJSON(needs.runners.outputs.runs_on).workspace_unit");
     expect(workspaceUnitTests).toContain("toJSON(fromJSON(needs.runners.outputs.runs_on).workspace_unit)");
@@ -1345,7 +1429,7 @@ process.stdin.on("end", () => {
     expect(uiP0).toContain(
       "toJSON(matrix.shard == 'project-collab' && fromJSON(needs.runners.outputs.runs_on).ui_p0_heavy || fromJSON(needs.runners.outputs.runs_on).ui_p0)",
     );
-    expect(uiP0).toContain("include: ${{ fromJSON(needs.scopes.outputs.ui_p0_matrix) }}");
+    expect(uiP0).toContain("include: ${{ fromJSON(needs.plan.outputs.ui_p0_matrix) }}");
     expect(uiP0CiMatrix.map((entry) => entry.name)).toEqual([
       "entry-settings",
       "project-workspace",
@@ -1453,7 +1537,7 @@ process.stdin.on("end", () => {
 
   it("[P1] routes external fork PRs through GitHub-hosted runner profiles", async () => {
     const workflow = await readFile(ciWorkflowPath, "utf8");
-    const runners = sectionBetween(workflow, "  runners:", "  scopes:");
+    const runners = sectionBetween(workflow, "  runners:", "  plan:");
 
     expect(runners).toContain("github.event_name == 'pull_request'");
     expect(runners).toContain("github.event.pull_request.head.repo.full_name != github.repository");
@@ -1628,7 +1712,7 @@ process.stdin.on("end", () => {
 
     const performanceProfiles = await runRunners("performance");
     const performanceRunsOn = runnerRunsOn(performanceProfiles);
-    expect(runnerDecision(performanceProfiles)).toEqual({ schema_version: 1, mode: "performance" });
+    expect(runnerDecision(performanceProfiles)).toEqual({ schema_version: 1, mode: "default" });
     expect(performanceRunsOn.control).toEqual(["nexu-runners-small"]);
     expect(performanceRunsOn.general_medium).toEqual(["nexu-runners-medium"]);
     expect(performanceRunsOn.workspace_unit).toEqual(["nexu-runners-medium"]);
@@ -1666,9 +1750,7 @@ process.stdin.on("end", () => {
     expect(economicRunsOn.visual_hot).toEqual(["ubuntu-24.04"]);
 
     for (const invalidMode of ["Economic", " economic "]) {
-      const fallbackProfiles = await runRunners(invalidMode);
-      expect(runnerDecision(fallbackProfiles)).toEqual({ schema_version: 1, mode: "default" });
-      expect(runnerRunsOn(fallbackProfiles).control).toEqual(["nexu-runners-small"]);
+      await expect(runRunners(invalidMode)).rejects.toThrow("unknown runner mode");
     }
   });
 

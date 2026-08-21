@@ -333,7 +333,7 @@ import { buildContinueInCliToast } from '../lib/build-continue-in-cli-toast';
 import { buildClipboardPrompt } from '../lib/build-clipboard-prompt';
 import { copyToClipboard } from '../lib/copy-to-clipboard';
 import { effectiveMaxTokens } from '../state/maxTokens';
-import { effectiveAgentModelChoice } from './agentModelSelection';
+import { effectiveAgentModelChoice, effectiveAgentModelId } from './agentModelSelection';
 import { mediaExecutionPolicyForProjectMetadata } from '../media/execution-policy';
 import { mediaModelProviderId } from '../media/models';
 import { byokProviderRequiresApiKey } from '../utils/byokProvider';
@@ -6709,6 +6709,10 @@ export function ProjectView({
               persistedWorkspaceId.length > 0
               || projectWorkspaceScopeState.scope?.kind === 'unbound'
             );
+          const amrModelId = effectiveAgentModelId(
+            agentsById.get('amr'),
+            config.agentModels?.amr,
+          );
           const gate =
             deferAmrPreflightToDaemon
               ? { kind: 'allow' as const }
@@ -6721,6 +6725,7 @@ export function ProjectView({
                           projectRunPreflightContext.workspaceMemberId,
                       }
                     : undefined,
+                  amrModelId,
                 );
           // A blocked send parks in the conversation queue with its FULL
           // payload (prompt, attachments, comment context) — the composer
@@ -11028,9 +11033,14 @@ export function ProjectView({
     </>
   );
 
+  // The `.app` shell belongs to the caller, not to this component. App.tsx
+  // renders the same `div.app` around both this view and
+  // ProjectCreationPendingView so React reconciles one element across the
+  // hand-off. Owning the shell here would make each view mount its own
+  // element and replay the `.app` entrance animation, which reads as the
+  // project frame flashing twice on the way in from Home.
   return (
     <CollabProvider value={collabValue}>
-    <div className="app">
       <CritiqueTheaterMount
         projectId={project.id}
         enabled={critiqueTheaterEnabled}
@@ -11559,7 +11569,6 @@ export function ProjectView({
           />
         ) : null}
       </AnimatePresence>
-    </div>
     </CollabProvider>
   );
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   GO_PLAN_CAMPAIGN,
   GO_PLAN_PRICING_URL,
+  goPlanPricingUrl,
   goPlanCampaignNextBoundary,
   isGoPlanCampaignWindowOpen,
   resolveSubscriptionAudience,
@@ -14,6 +15,7 @@ describe('Go plan touchpoints', () => {
     const start = Date.parse(GO_PLAN_CAMPAIGN.window.startAt);
     const end = Date.parse(GO_PLAN_CAMPAIGN.window.endAtExclusive);
 
+    expect(GO_PLAN_CAMPAIGN.window.startAt).toBe('2026-08-20T17:00:00+08:00');
     expect(isGoPlanCampaignWindowOpen(start - 1)).toBe(false);
     expect(isGoPlanCampaignWindowOpen(start)).toBe(true);
     expect(isGoPlanCampaignWindowOpen(end - 1)).toBe(true);
@@ -24,6 +26,27 @@ describe('Go plan touchpoints', () => {
     expect(GO_PLAN_PRICING_URL).toBe('https://open-design.ai/pricing/');
   });
 
+  it('hands Pricing the source locale without targeting retired Landing routes', () => {
+    expect(goPlanPricingUrl('en')).toBe(
+      'https://open-design.ai/pricing/?od_locale=en',
+    );
+    expect(goPlanPricingUrl('zh-CN')).toBe(
+      'https://open-design.ai/zh/pricing/?od_locale=zh',
+    );
+    expect(goPlanPricingUrl('zh-TW')).toBe(
+      'https://open-design.ai/zh/pricing/?od_locale=zh',
+    );
+    expect(goPlanPricingUrl('pt-BR')).toBe(
+      'https://open-design.ai/pt-br/pricing/?od_locale=pt-br',
+    );
+    expect(goPlanPricingUrl('es-ES')).toBe(
+      'https://open-design.ai/es/pricing/?od_locale=es',
+    );
+    expect(goPlanPricingUrl('id')).toBe(
+      'https://open-design.ai/pricing/?od_locale=en',
+    );
+  });
+
   it('resolves paid and unpaid state independently of the campaign window', () => {
     expect(resolveSubscriptionAudience({ plan: 'free', loggedIn: true })).toBe('unpaid');
     expect(resolveSubscriptionAudience({ plan: 'plus', loggedIn: true })).toBe('paid');
@@ -32,8 +55,23 @@ describe('Go plan touchpoints', () => {
   });
 
   it('keeps the confirmed Chinese lightweight-entry copy', () => {
-    expect(getGoPlanCampaignCopy('zh-CN').workbenchBadge).toBe('Go 首月 $5 · 无限用');
-    expect(getGoPlanCampaignCopy('en').workbenchBadge).toBe('Go first month $5 · unlimited use');
+    const chinese = getGoPlanCampaignCopy('zh-CN');
+    const english = getGoPlanCampaignCopy('en');
+
+    expect(chinese.workbenchBadge).toBe('全新 Go 套餐 · 首月 ¥5 · 模型无限用');
+    expect(chinese.headline).toBe('人人可用的低成本设计方案');
+    expect(chinese.description).toBe(
+      '以更低成本使用专业设计模型，让每一个想法更快成为作品。',
+    );
+    expect(chinese.cta).toBe('查看 Go 套餐 · 限时 5 折');
+    expect(english.workbenchBadge).toBe(
+      'The new Go Plan · ¥5 for the first month · Unlimited model usage',
+    );
+    expect(english.headline).toBe('Low-cost design plan for everyone');
+    expect(english.description).toBe(
+      'Professional design intelligence at a lower cost—so every idea moves faster from prompt to finished work.',
+    );
+    expect(english.cta).toBe('View Go plan · Limited-time 50% off');
   });
 
   it('ships localized modal and workbench copy for every supported locale', () => {

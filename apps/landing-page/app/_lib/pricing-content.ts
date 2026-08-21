@@ -16,6 +16,33 @@
  */
 import type { LandingLocaleCode } from '../i18n';
 
+export interface PricingPlanActionLabels {
+  current: string;
+  downgrade: string;
+  upgrade: string;
+}
+
+const PLAN_ACTION_LABELS: Partial<Record<LandingLocaleCode, PricingPlanActionLabels>> = {
+  en: { current: 'Current plan', downgrade: 'Downgrade to {plan}', upgrade: 'Upgrade to {plan}' },
+  zh: { current: '当前套餐', downgrade: '降级至 {plan}', upgrade: '升级至 {plan}' },
+  'zh-tw': { current: '目前方案', downgrade: '降級至 {plan}', upgrade: '升級至 {plan}' },
+  ja: { current: '現在のプラン', downgrade: '{plan} にダウングレード', upgrade: '{plan} にアップグレード' },
+  ko: { current: '현재 요금제', downgrade: '{plan}(으)로 다운그레이드', upgrade: '{plan}(으)로 업그레이드' },
+  de: { current: 'Aktueller Tarif', downgrade: 'Auf {plan} downgraden', upgrade: 'Auf {plan} upgraden' },
+  fr: { current: 'Offre actuelle', downgrade: 'Rétrograder vers {plan}', upgrade: 'Passer à {plan}' },
+  ru: { current: 'Текущий тариф', downgrade: 'Понизить до {plan}', upgrade: 'Повысить до {plan}' },
+  es: { current: 'Plan actual', downgrade: 'Bajar a {plan}', upgrade: 'Subir a {plan}' },
+  'pt-br': { current: 'Plano atual', downgrade: 'Fazer downgrade para {plan}', upgrade: 'Fazer upgrade para {plan}' },
+};
+
+export function getCurrentPlanLabel(locale: LandingLocaleCode): string {
+  return getPricingPlanActionLabels(locale).current;
+}
+
+export function getPricingPlanActionLabels(locale: LandingLocaleCode): PricingPlanActionLabels {
+  return PLAN_ACTION_LABELS[locale] ?? PLAN_ACTION_LABELS.en!;
+}
+
 export type PlanTierId = 'plus' | 'pro' | 'max';
 
 export interface PlanCopy {
@@ -90,6 +117,8 @@ export interface PricingLabels {
   footnote: string;
   /** Linked text inside the footnote, pointing at the cloud console. */
   consoleLabel: string;
+  /** Visible failure when an explicit Cloud Console handoff is invalid. */
+  checkoutDestinationUnavailable: string;
 }
 
 /** Copy owned by the live Personal comparison component. */
@@ -105,6 +134,7 @@ export interface PersonalPricingCopy {
   creatorDeveloperSupport: string;
   popularModels: string;
   flagshipModels: string;
+  flagshipModelCount: string;
   imageModels: string;
   modelCount: string;
   unlimited: string;
@@ -122,7 +152,6 @@ export interface PersonalPricingCopy {
   estimatedRequests: string;
   estimatedRequestsAria: string;
   usageAllowanceNote: string;
-  usagePeakNote: string;
   usageEstimatesNote: string;
   comparisonTitle: string;
   category: string;
@@ -244,6 +273,7 @@ const PERSONAL_EN: PersonalPricingCopy = {
   creatorDeveloperSupport: 'Creator / developer support',
   popularModels: 'Popular models',
   flagshipModels: 'Flagship models',
+  flagshipModelCount: '{count}+ flagship models',
   imageModels: 'Image models',
   modelCount: '{count} models',
   unlimited: 'Unlimited',
@@ -261,7 +291,6 @@ const PERSONAL_EN: PersonalPricingCopy = {
   estimatedRequests: 'Estimated requests every 5 hours',
   estimatedRequestsAria: 'Estimated model requests every 5 hours',
   usageAllowanceNote: 'Popular models include ample allowance, roughly equivalent to $16 every 5 hours · $40 weekly · $80 monthly. Actual usage varies by model and context length.',
-  usagePeakNote: 'DeepSeek V4 Flash / Pro estimates use off-peak pricing; unit usage counts ×2 during peak hours (Beijing time 09:00–12:00 and 14:00–18:00).',
   usageEstimatesNote: 'Estimated request counts by model may change with model pricing, usage patterns, and user feedback.',
   comparisonTitle: 'Compare every model across plans',
   category: 'Category',
@@ -289,6 +318,7 @@ const PERSONAL_ZH_CN: PersonalPricingCopy = {
   creatorDeveloperSupport: '创作者 / 开发者支持',
   popularModels: '热门模型',
   flagshipModels: '旗舰模型',
+  flagshipModelCount: '{count}+ 个旗舰模型',
   imageModels: '图片模型',
   modelCount: '{count} 个模型',
   unlimited: '无限量',
@@ -306,7 +336,6 @@ const PERSONAL_ZH_CN: PersonalPricingCopy = {
   estimatedRequests: '每 5 小时预估可用次数',
   estimatedRequestsAria: '模型每 5 小时预估请求数',
   usageAllowanceNote: '热门模型提供充足额度，大致相当于每 5 小时 $16 · 每周 $40 · 每月 $80。实际用量因模型和上下文长度而异。',
-  usagePeakNote: 'DeepSeek V4 Flash / Pro 按非高峰价格估算；高峰时段（北京时间 09:00–12:00、14:00–18:00）单位消耗 ×2。',
   usageEstimatesNote: '各模型的预估次数可能随模型价格、使用情况与用户反馈调整。',
   comparisonTitle: '对比各套餐的全部模型',
   category: '分类',
@@ -334,6 +363,7 @@ const PERSONAL_ZH_TW: PersonalPricingCopy = {
   creatorDeveloperSupport: '創作者 / 開發者支援',
   popularModels: '熱門模型',
   flagshipModels: '旗艦模型',
+  flagshipModelCount: '{count}+ 個旗艦模型',
   imageModels: '圖片模型',
   modelCount: '{count} 個模型',
   unlimited: '無限量',
@@ -351,7 +381,6 @@ const PERSONAL_ZH_TW: PersonalPricingCopy = {
   estimatedRequests: '每 5 小時預估可用次數',
   estimatedRequestsAria: '模型每 5 小時預估請求數',
   usageAllowanceNote: '熱門模型提供充足額度，大致相當於每 5 小時 $16 · 每週 $40 · 每月 $80。實際用量依模型與上下文長度而異。',
-  usagePeakNote: 'DeepSeek V4 Flash / Pro 依離峰價格估算；尖峰時段（北京時間 09:00–12:00、14:00–18:00）單位用量 ×2。',
   usageEstimatesNote: '各模型的預估次數可能依模型價格、使用情況與使用者回饋調整。',
   comparisonTitle: '比較各方案的全部模型',
   category: '分類',
@@ -379,6 +408,7 @@ const PERSONAL_ES: PersonalPricingCopy = {
   creatorDeveloperSupport: 'Soporte para creadores / desarrolladores',
   popularModels: 'Modelos populares',
   flagshipModels: 'Modelos insignia',
+  flagshipModelCount: '{count}+ modelos insignia',
   imageModels: 'Modelos de imagen',
   modelCount: '{count} modelos',
   unlimited: 'Ilimitado',
@@ -396,7 +426,6 @@ const PERSONAL_ES: PersonalPricingCopy = {
   estimatedRequests: 'Solicitudes estimadas cada 5 horas',
   estimatedRequestsAria: 'Solicitudes de modelo estimadas cada 5 horas',
   usageAllowanceNote: 'Los modelos populares incluyen una capacidad amplia, equivalente aproximadamente a $16 cada 5 horas · $40 por semana · $80 al mes. El uso real varía según el modelo y la longitud del contexto.',
-  usagePeakNote: 'Las estimaciones de DeepSeek V4 Flash / Pro usan precios fuera de hora punta; el consumo por unidad se duplica en hora punta (hora de Pekín 09:00–12:00 y 14:00–18:00).',
   usageEstimatesNote: 'Las solicitudes estimadas pueden cambiar según el precio del modelo, los patrones de uso y los comentarios de los usuarios.',
   comparisonTitle: 'Compara todos los modelos entre planes',
   category: 'Categoría',
@@ -424,6 +453,7 @@ const PERSONAL_PT_BR: PersonalPricingCopy = {
   creatorDeveloperSupport: 'Suporte para criadores / desenvolvedores',
   popularModels: 'Modelos populares',
   flagshipModels: 'Modelos de ponta',
+  flagshipModelCount: '{count}+ modelos de ponta',
   imageModels: 'Modelos de imagem',
   modelCount: '{count} modelos',
   unlimited: 'Ilimitado',
@@ -441,7 +471,6 @@ const PERSONAL_PT_BR: PersonalPricingCopy = {
   estimatedRequests: 'Solicitações estimadas a cada 5 horas',
   estimatedRequestsAria: 'Solicitações de modelo estimadas a cada 5 horas',
   usageAllowanceNote: 'Os modelos populares incluem uma franquia ampla, aproximadamente equivalente a $16 a cada 5 horas · $40 por semana · $80 por mês. O uso real varia conforme o modelo e o tamanho do contexto.',
-  usagePeakNote: 'As estimativas do DeepSeek V4 Flash / Pro usam preços fora do horário de pico; o consumo por unidade dobra no pico (horário de Pequim 09:00–12:00 e 14:00–18:00).',
   usageEstimatesNote: 'As solicitações estimadas podem mudar conforme o preço do modelo, os padrões de uso e o feedback dos usuários.',
   comparisonTitle: 'Compare todos os modelos entre os planos',
   category: 'Categoria',
@@ -469,6 +498,7 @@ const PERSONAL_RU: PersonalPricingCopy = {
   creatorDeveloperSupport: 'Поддержка авторов / разработчиков',
   popularModels: 'Популярные модели',
   flagshipModels: 'Флагманские модели',
+  flagshipModelCount: '{count}+ флагманских моделей',
   imageModels: 'Модели изображений',
   modelCount: '{count} моделей',
   unlimited: 'Без ограничений',
@@ -486,7 +516,6 @@ const PERSONAL_RU: PersonalPricingCopy = {
   estimatedRequests: 'Оценка запросов каждые 5 часов',
   estimatedRequestsAria: 'Оценка запросов к моделям каждые 5 часов',
   usageAllowanceNote: 'Популярные модели включают большой лимит, примерно равный $16 каждые 5 часов · $40 в неделю · $80 в месяц. Фактический расход зависит от модели и длины контекста.',
-  usagePeakNote: 'Оценки DeepSeek V4 Flash / Pro используют внепиковые цены; в часы пик (по пекинскому времени 09:00–12:00 и 14:00–18:00) расход единиц удваивается.',
   usageEstimatesNote: 'Оценка числа запросов может меняться вместе с ценой модели, характером использования и отзывами пользователей.',
   comparisonTitle: 'Сравните все модели во всех планах',
   category: 'Категория',
@@ -514,6 +543,7 @@ const PERSONAL_FR: PersonalPricingCopy = {
   creatorDeveloperSupport: 'Support créateur / développeur',
   popularModels: 'Modèles populaires',
   flagshipModels: 'Modèles phares',
+  flagshipModelCount: '{count}+ modèles phares',
   imageModels: 'Modèles d’image',
   modelCount: '{count} modèles',
   unlimited: 'Illimité',
@@ -531,7 +561,6 @@ const PERSONAL_FR: PersonalPricingCopy = {
   estimatedRequests: 'Requêtes estimées toutes les 5 heures',
   estimatedRequestsAria: 'Requêtes de modèles estimées toutes les 5 heures',
   usageAllowanceNote: 'Les modèles populaires incluent un quota généreux, soit environ 16 $ toutes les 5 heures · 40 $ par semaine · 80 $ par mois. L’usage réel varie selon le modèle et la longueur du contexte.',
-  usagePeakNote: 'Les estimations DeepSeek V4 Flash / Pro utilisent les tarifs hors pointe ; la consommation unitaire est doublée aux heures de pointe (heure de Pékin 09:00–12:00 et 14:00–18:00).',
   usageEstimatesNote: 'Le nombre estimé de requêtes peut évoluer avec le prix des modèles, les usages et les retours des utilisateurs.',
   comparisonTitle: 'Comparez tous les modèles selon les offres',
   category: 'Catégorie',
@@ -559,6 +588,7 @@ const PERSONAL_KO: PersonalPricingCopy = {
   creatorDeveloperSupport: '크리에이터 / 개발자 지원',
   popularModels: '인기 모델',
   flagshipModels: '플래그십 모델',
+  flagshipModelCount: '{count}+ 플래그십 모델',
   imageModels: '이미지 모델',
   modelCount: '모델 {count}개',
   unlimited: '무제한',
@@ -576,7 +606,6 @@ const PERSONAL_KO: PersonalPricingCopy = {
   estimatedRequests: '5시간마다 예상 사용 횟수',
   estimatedRequestsAria: '5시간마다 예상 모델 요청 수',
   usageAllowanceNote: '인기 모델에는 넉넉한 한도가 포함되며, 대략 5시간마다 $16 · 주당 $40 · 월 $80에 해당합니다. 실제 사용량은 모델과 컨텍스트 길이에 따라 달라집니다.',
-  usagePeakNote: 'DeepSeek V4 Flash / Pro 예상치는 비혼잡 시간대 요금을 기준으로 하며, 혼잡 시간대(베이징 시간 09:00–12:00, 14:00–18:00)에는 단위 사용량이 2배입니다.',
   usageEstimatesNote: '모델별 예상 요청 수는 모델 가격, 사용 패턴, 사용자 피드백에 따라 조정될 수 있습니다.',
   comparisonTitle: '요금제별 전체 모델 비교',
   category: '분류',
@@ -604,6 +633,7 @@ const PERSONAL_DE: PersonalPricingCopy = {
   creatorDeveloperSupport: 'Support für Kreative / Entwickler',
   popularModels: 'Beliebte Modelle',
   flagshipModels: 'Flaggschiffmodelle',
+  flagshipModelCount: '{count}+ Flaggschiffmodelle',
   imageModels: 'Bildmodelle',
   modelCount: '{count} Modelle',
   unlimited: 'Unbegrenzt',
@@ -621,7 +651,6 @@ const PERSONAL_DE: PersonalPricingCopy = {
   estimatedRequests: 'Geschätzte Anfragen alle 5 Stunden',
   estimatedRequestsAria: 'Geschätzte Modellanfragen alle 5 Stunden',
   usageAllowanceNote: 'Beliebte Modelle enthalten ein großzügiges Kontingent, ungefähr entsprechend $16 alle 5 Stunden · $40 pro Woche · $80 pro Monat. Die tatsächliche Nutzung variiert je nach Modell und Kontextlänge.',
-  usagePeakNote: 'Die Schätzungen für DeepSeek V4 Flash / Pro verwenden Nebenzeitenpreise; zu Spitzenzeiten (Peking-Zeit 09:00–12:00 und 14:00–18:00) zählt der Verbrauch doppelt.',
   usageEstimatesNote: 'Die geschätzten Anfragen pro Modell können sich mit Modellpreisen, Nutzungsmustern und Nutzerfeedback ändern.',
   comparisonTitle: 'Alle Modelle nach Tarif vergleichen',
   category: 'Kategorie',
@@ -649,6 +678,7 @@ const PERSONAL_JA: PersonalPricingCopy = {
   creatorDeveloperSupport: 'クリエイター / 開発者サポート',
   popularModels: '人気モデル',
   flagshipModels: 'フラッグシップモデル',
+  flagshipModelCount: 'フラッグシップモデル {count} 種以上',
   imageModels: '画像モデル',
   modelCount: '{count} モデル',
   unlimited: '無制限',
@@ -666,7 +696,6 @@ const PERSONAL_JA: PersonalPricingCopy = {
   estimatedRequests: '5 時間ごとの推定リクエスト数',
   estimatedRequestsAria: '5 時間ごとのモデル推定リクエスト数',
   usageAllowanceNote: '人気モデルには十分な利用枠が含まれ、目安は 5 時間ごとに $16 · 週 $40 · 月 $80 相当です。実際の使用量はモデルとコンテキスト長によって異なります。',
-  usagePeakNote: 'DeepSeek V4 Flash / Pro の推定値はオフピーク料金を使用します。ピーク時間（北京時間 09:00–12:00、14:00–18:00）は単位使用量が 2 倍になります。',
   usageEstimatesNote: 'モデル別の推定回数は、モデル価格、利用状況、ユーザーフィードバックに応じて変更される場合があります。',
   comparisonTitle: 'プラン別に全モデルを比較',
   category: 'カテゴリー',
@@ -688,6 +717,7 @@ const EN: PricingContent = {
     heroTitle: 'Pay only for AI tasks that deliver results',
     footnote: 'Prices shown in USD. Checkout, billing, and auto top-up are handled in the {console}. Adjust or cancel your plan anytime.',
     consoleLabel: 'OpenDesign Cloud console',
+    checkoutDestinationUnavailable: 'Checkout destination unavailable. Return to your Cloud Console and open Pricing again.',
     monthly: 'Monthly',
     yearly: 'Yearly',
     yearlySave: 'Save up to 51%',
@@ -709,8 +739,8 @@ const EN: PricingContent = {
     freeTrialCreditLabel: 'Limited trial model credits (valid for 7 days)',
     firstMonthTag: '{pct}% off 1st month',
     yearlyDiscountTag: '{pct}% off',
-    yearlySubline: 'Billed yearly · {totalUsd} / year (save {savingsUsd})',
-    monthlyRenewal: 'Then {amountUsd} / mo',
+    yearlySubline: 'Billed {totalUsd}/year',
+    monthlyRenewal: 'First-month price',
     yearlySaveCta: 'Save {savingsUsd} yearly',
   },
   free: {
@@ -720,8 +750,8 @@ const EN: PricingContent = {
     features: ['BYOK provider keys · Local coding agents', 'Community support'],
   },
   go: {
-    tagline: 'Lightweight needs, effortless delivery · Zero-config',
-    ctaLabel: 'Subscribe to Go',
+    tagline: 'Light needs · Easy delivery',
+    ctaLabel: 'Subscribe',
     allowance: '8 popular models · ample allowance',
     features: [
       'Full design and coding capabilities',
@@ -731,8 +761,8 @@ const EN: PricingContent = {
   },
   plans: {
     plus: {
-      tagline: 'Independent projects, solo delivery · Zero-config',
-      ctaLabel: 'Upgrade to Plus',
+      tagline: 'Everyday design · Continuous delivery',
+      ctaLabel: 'Subscribe',
       concurrency: '2 concurrent tasks',
       features: [
         'Zero-config professional design agent',
@@ -742,8 +772,8 @@ const EN: PricingContent = {
       ],
     },
     pro: {
-      tagline: 'One person, a whole design team · Zero-config',
-      ctaLabel: 'Upgrade to Pro',
+      tagline: 'Complex projects · Efficient production',
+      ctaLabel: 'Subscribe',
       concurrency: '5 concurrent tasks',
       features: [
         'Zero-config professional design agent',
@@ -753,8 +783,8 @@ const EN: PricingContent = {
       ],
     },
     max: {
-      tagline: 'Outsourced design costs, slashed · Zero-config',
-      ctaLabel: 'Upgrade to Max',
+      tagline: 'High-volume creation · Consistent output',
+      ctaLabel: 'Subscribe',
       concurrency: '10 concurrent tasks',
       features: [
         'Zero-config professional design agent',
@@ -773,6 +803,7 @@ const ZH_CN: PricingContent = {
     heroTitle: '只为实际完成的 AI 任务付费',
     footnote: '价格以美元计。结账、账单与自动充值均在 {console} 完成。可随时调整或取消套餐。',
     consoleLabel: 'OpenDesign Cloud 控制台',
+    checkoutDestinationUnavailable: '结账环境不可用。请返回 Cloud 控制台后重新打开价格页。',
     monthly: '月付',
     yearly: '年付',
     yearlySave: '省最多 51%',
@@ -805,14 +836,14 @@ const ZH_CN: PricingContent = {
     features: ['BYOK 自带密钥，支持本地 Coding Agent', '社区支持'],
   },
   go: {
-    tagline: '轻量需求，轻松交付 · 零配置即用',
+    tagline: '轻量需求，轻松交付',
     ctaLabel: '订阅 Go',
     allowance: '8 个热门模型 · 充裕额度',
     features: ['完整设计与 Coding 能力', '无需配置供应商 API Key', '额度自动恢复'],
   },
   plans: {
     plus: {
-      tagline: '独立项目、零散需求，单人交付 · 零配置即用',
+      tagline: '独立项目、零散需求，单人交付',
       ctaLabel: '升级 Plus',
       concurrency: '2 个任务并发',
       features: [
@@ -823,7 +854,7 @@ const ZH_CN: PricingContent = {
       ],
     },
     pro: {
-      tagline: '一个人产出整个设计团队的活 · 零配置即用',
+      tagline: '一个人产出整个设计团队的活',
       ctaLabel: '升级 Pro',
       concurrency: '5 个任务并发',
       features: [
@@ -834,7 +865,7 @@ const ZH_CN: PricingContent = {
       ],
     },
     max: {
-      tagline: '把外包设计费砸到零头 · 零配置即用',
+      tagline: '把外包设计费砸到零头',
       ctaLabel: '升级 Max',
       concurrency: '10 个任务并发',
       features: [
@@ -854,6 +885,7 @@ const ZH_TW: PricingContent = {
     heroTitle: '只為實際完成的 AI 任務付費',
     footnote: '價格以美元計。結帳、帳單與自動加值皆於 {console} 完成。可隨時調整或取消方案。',
     consoleLabel: 'OpenDesign Cloud 主控台',
+    checkoutDestinationUnavailable: '結帳環境無法使用。請返回 Cloud 主控台後重新開啟價格頁。',
     monthly: '月付',
     yearly: '年付',
     yearlySave: '最多省 51%',
@@ -886,14 +918,14 @@ const ZH_TW: PricingContent = {
     features: ['BYOK 自帶密鑰，支援本機 Coding Agent', '社群支援'],
   },
   go: {
-    tagline: '輕量需求，輕鬆交付 · 零配置即用',
+    tagline: '輕量需求，輕鬆交付',
     ctaLabel: '訂閱 Go',
     allowance: '8 個熱門模型 · 充裕額度',
     features: ['完整設計與 Coding 能力', '無需配置供應商 API Key', '額度自動恢復'],
   },
   plans: {
     plus: {
-      tagline: '獨立專案、零散需求，單人交付 · 零配置即用',
+      tagline: '獨立專案、零散需求，單人交付',
       ctaLabel: '升級 Plus',
       concurrency: '2 個任務並行',
       features: [
@@ -904,7 +936,7 @@ const ZH_TW: PricingContent = {
       ],
     },
     pro: {
-      tagline: '一個人產出整個設計團隊的活 · 零配置即用',
+      tagline: '一個人產出整個設計團隊的活',
       ctaLabel: '升級 Pro',
       concurrency: '5 個任務並行',
       features: [
@@ -915,7 +947,7 @@ const ZH_TW: PricingContent = {
       ],
     },
     max: {
-      tagline: '把外包設計費砍到零頭 · 零配置即用',
+      tagline: '把外包設計費砍到零頭',
       ctaLabel: '升級 Max',
       concurrency: '10 個任務並行',
       features: [
@@ -935,6 +967,7 @@ const ES: PricingContent = {
     heroTitle: 'Paga solo por tareas de IA completadas',
     footnote: 'Precios en USD. El pago, la facturación y la recarga automática se gestionan en la {console}. Cambia o cancela tu plan cuando quieras.',
     consoleLabel: 'consola de OpenDesign Cloud',
+    checkoutDestinationUnavailable: 'El destino de pago no está disponible. Vuelve a la consola Cloud y abre Precios de nuevo.',
     monthly: 'Mensual',
     yearly: 'Anual',
     yearlySave: 'Ahorra hasta 51%',
@@ -1016,6 +1049,7 @@ const PT_BR: PricingContent = {
     heroTitle: 'Pague apenas por tarefas de IA concluídas',
     footnote: 'Preços em USD. Pagamento, faturamento e recarga automática são feitos no {console}. Ajuste ou cancele seu plano quando quiser.',
     consoleLabel: 'console do OpenDesign Cloud',
+    checkoutDestinationUnavailable: 'O destino de pagamento não está disponível. Volte ao console Cloud e abra Preços novamente.',
     monthly: 'Mensal',
     yearly: 'Anual',
     yearlySave: 'Economize até 51%',
@@ -1097,6 +1131,7 @@ const RU: PricingContent = {
     heroTitle: 'Платите только за выполненные задачи ИИ',
     footnote: 'Цены указаны в USD. Оплата, выставление счетов и автопополнение выполняются в {console}. Изменение или отмена тарифа в любое время.',
     consoleLabel: 'консоли OpenDesign Cloud',
+    checkoutDestinationUnavailable: 'Среда оплаты недоступна. Вернитесь в консоль Cloud и снова откройте страницу тарифов.',
     monthly: 'Месяц',
     yearly: 'Год',
     yearlySave: 'Экономия до 51%',
@@ -1178,6 +1213,7 @@ const FR: PricingContent = {
     heroTitle: 'Payez uniquement pour les tâches IA terminées',
     footnote: 'Prix indiqués en USD. Le paiement, la facturation et la recharge automatique se gèrent dans la {console}. Ajustez ou résiliez votre forfait à tout moment.',
     consoleLabel: 'console OpenDesign Cloud',
+    checkoutDestinationUnavailable: 'La destination de paiement est indisponible. Revenez à la console Cloud et rouvrez la page Tarifs.',
     monthly: 'Mensuel',
     yearly: 'Annuel',
     yearlySave: 'Économisez jusqu’à 51%',
@@ -1259,6 +1295,7 @@ const KO: PricingContent = {
     heroTitle: '완료된 AI 작업에만 비용을 지불하세요',
     footnote: '가격은 USD 기준입니다. 결제, 청구, 자동 충전은 {console}에서 처리됩니다. 플랜 변경 또는 취소는 언제든 가능합니다.',
     consoleLabel: 'OpenDesign Cloud 콘솔',
+    checkoutDestinationUnavailable: '결제 환경을 사용할 수 없습니다. Cloud 콘솔로 돌아가 요금 페이지를 다시 여세요.',
     monthly: '월간',
     yearly: '연간',
     yearlySave: '최대 51% 절약',
@@ -1340,6 +1377,7 @@ const DE: PricingContent = {
     heroTitle: 'Zahle nur für abgeschlossene KI-Aufgaben',
     footnote: 'Preise in USD. Checkout, Abrechnung und automatisches Aufladen erfolgen in der {console}. Plan jederzeit anpassen oder kündigen.',
     consoleLabel: 'OpenDesign Cloud Konsole',
+    checkoutDestinationUnavailable: 'Das Zahlungsziel ist nicht verfügbar. Kehre zur Cloud-Konsole zurück und öffne die Preisseite erneut.',
     monthly: 'Monatlich',
     yearly: 'Jährlich',
     yearlySave: 'Bis zu 51% sparen',
@@ -1421,6 +1459,7 @@ const JA: PricingContent = {
     heroTitle: '完了した AI タスクにだけ支払う',
     footnote: '価格は米ドル表示です。決済・請求・自動チャージは {console} で行います。プランの変更・解約はいつでも可能です。',
     consoleLabel: 'OpenDesign Cloud コンソール',
+    checkoutDestinationUnavailable: '決済先を利用できません。Cloud コンソールに戻り、料金ページを開き直してください。',
     monthly: '月額',
     yearly: '年額',
     yearlySave: '最大 51% オフ',
