@@ -7323,7 +7323,24 @@ export async function startServer({
 
   app.get('/api/version', async (_req, res) => {
     const version = await readCurrentAppVersionInfo();
-    res.json({ version });
+    // Now that this payload carries a runtime capability it is no longer a
+    // near-static fact about the build: the same URL answers differently
+    // depending on which daemon is behind it. A cached response therefore
+    // outlives the daemon that produced it, and a stale `slideRenderer: true`
+    // is consumed as authoritative — reopening the export the gate exists to
+    // hide. Must not be cached anywhere.
+    res.setHeader('Cache-Control', 'no-store');
+    // Runtime capabilities ride along on the version payload rather than a
+    // dedicated endpoint: this is already the "what runtime am I talking to"
+    // channel (packaged/channel/platform/arch), the web fetches it once at
+    // boot, and computing the flag from the very binding the export routes
+    // guard on means the advertisement cannot drift from the 501 they return.
+    res.json({
+      version: {
+        ...version,
+        capabilities: { slideRenderer: typeof desktopSlideRenderer === 'function' },
+      },
+    });
   });
 
   // Powered-preview isolation info. Reports the daemon's own directly-reachable

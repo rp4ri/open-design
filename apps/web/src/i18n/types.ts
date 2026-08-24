@@ -1127,7 +1127,6 @@ export interface Dict {
   'entry.discordAria': string;
   'entry.discordAriaWithOnline': string;
   'entry.discordOnlineLabel': string;
-  'entry.feishuAria': string;
   'entry.mailAria': string;
   'entry.accountSettings': string;
   'chat.collapsePane': string;
@@ -4114,6 +4113,7 @@ export interface Dict {
   'fileViewer.exportPptxBusy': string;
   'fileViewer.exportPptxHint': string;
   'fileViewer.exportPptxNa': string;
+  'fileViewer.exportDaemonUnreachable': string;
   'fileViewer.exportZip': string;
   'fileViewer.exportHtml': string;
   'fileViewer.exportMd': string;
