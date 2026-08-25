@@ -22,12 +22,15 @@ import {
   type SetStateAction,
 } from 'react';
 import {
+  automaticStrategyTaskProfileForProjectMetadata,
   defaultScenarioPluginIdForProjectMetadata,
   type AmrWalletSnapshot,
   type ChatSessionMode,
   type ConnectorDetail,
+  type CreateProjectExampleReference,
   type InstalledPluginRecord,
   type RunContextSelection,
+  type ProjectScenarioTaskProfile,
   type WorkspaceProjectSummary,
 } from '@open-design/contracts';
 import type { OpenDesignHostProjectImportSuccess } from '@open-design/host';
@@ -120,6 +123,7 @@ import {
 } from '../runtime/amr-balance-gate';
 import { isPaidAmrPlan, resolveAmrPlan } from '../runtime/amr-low-balance-plan';
 import { HomeView, seedHomeComposerPrompt } from './HomeView';
+import { entryStrategyRoutingFields } from './entry-strategy-routing';
 import { EntryBlankState } from './EntryBlankState';
 import { RecentProjectsStrip } from './RecentProjectsStrip';
 import {
@@ -157,10 +161,6 @@ import { useWorkspaceInvalidation } from '../collab/workspace-events';
 import { resolvePlanLabelTier } from '../collab/team-plan';
 import { resolveDeepSeekV4FlashCampaignAudience } from '../campaigns/deepseek-v4-flash';
 import { useDeepSeekV4FlashCampaignVisibility } from '../campaigns/use-deepseek-v4-flash-campaign';
-import {
-  resolveSubscriptionAudience,
-} from '../campaigns/go-plan';
-import { useGoPlanCampaignVisibility } from '../campaigns/use-go-plan-campaign';
 import { WorkbenchCampaignBadge } from './WorkbenchCampaignBadge';
 import {
   beginWorkspaceScopedRead,
@@ -290,6 +290,9 @@ type EntryCreateProjectInput = Omit<CreateInput, 'metadata'> & {
   pluginType?: string;
   appliedPluginSnapshotId?: string;
   pluginInputs?: Record<string, unknown>;
+  automaticStrategyTaskProfile?: ProjectScenarioTaskProfile;
+  /** Official example card the user picked under the automatic route. */
+  exampleReference?: CreateProjectExampleReference;
   initialRunContext?: RunContextSelection | null;
   conversationMode?: ChatSessionMode;
   autoSendFirstMessage?: boolean;
@@ -656,7 +659,6 @@ export function EntryShell({
     workspaceContext,
   );
   const deepSeekCampaignVisibility = useDeepSeekV4FlashCampaignVisibility();
-  const goPlanCampaignVisibility = useGoPlanCampaignVisibility();
   // Same personal-vs-team accountPlan rule as App's `resolvedAmrPlan`.
   const deepSeekCampaignPlan = resolvePlanLabelTier({
     billing: workspaceBilling,
@@ -674,24 +676,10 @@ export function EntryShell({
     loggedIn: amrLoggedIn,
     now: deepSeekCampaignVisibility.now,
   });
-  const subscriptionAudience = resolveSubscriptionAudience({
-    plan: deepSeekCampaignPlan,
-    loggedIn: amrLoggedIn,
-  });
-  const homeCampaignModalAudience =
-    subscriptionAudience === 'unpaid' && goPlanCampaignVisibility.visible
-      ? 'unpaid'
-      : deepSeekV4FlashCampaignAudience === 'paid'
-        ? 'paid'
-        : 'unknown';
-  const topRightCampaignKind =
-    subscriptionAudience === 'unpaid'
-      ? goPlanCampaignVisibility.visible
-        ? 'go'
-        : null
-      : deepSeekV4FlashCampaignAudience === 'paid'
-        ? 'deepseek'
-        : null;
+  const topRightCampaignAudience =
+    deepSeekV4FlashCampaignAudience === 'unknown'
+      ? null
+      : deepSeekV4FlashCampaignAudience;
   const workspaceBalanceUsd = workspaceBillingBalanceUsd(
     workspaceBillingResponse,
     workspaceContext,
@@ -1301,10 +1289,26 @@ export function EntryShell({
     // single row without touching the form.
     const pluginId = defaultPluginIdForMetadata(input.metadata);
     const pluginInputs = defaultPluginInputsForCreate(input, pluginId);
+    const { skillSelectionProvenance, ...projectInput } = input;
+    const automaticStrategyRoute = skillSelectionProvenance === 'explicit-user'
+      ? null
+      : automaticStrategyTaskProfileForProjectMetadata(input.metadata);
     return onCreateProject({
-      ...input,
-      ...(pluginId ? { pluginId } : {}),
-      ...(pluginInputs ? { pluginInputs } : {}),
+      ...projectInput,
+      // The modal's Blank card historically persisted a hidden default Skill
+      // (for example agent-browser) even though the automatic scenario already
+      // owns the task workflow. When OD Next replaces that scenario, carrying
+      // the hidden Skill makes it look user-selected and can correctly trip
+      // the planning-only validator. Keep explicit template/Skill picks exact;
+      // omit only the UI's implicit default on the four automatic routes.
+      ...(automaticStrategyRoute && skillSelectionProvenance === 'automatic-default'
+        ? { skillId: null }
+        : {}),
+      ...(automaticStrategyRoute
+        ? { automaticStrategyTaskProfile: automaticStrategyRoute }
+        : pluginInputs
+          ? { pluginInputs }
+          : {}),
     });
   }
 
@@ -1450,10 +1454,11 @@ export function EntryShell({
         examplePromptBrief: payload.examplePromptContext.brief,
       } : {}),
     };
+    const strategyRoutingFields = entryStrategyRoutingFields(payload, metadata);
     const createInput: EntryCreateProjectInput = {
       name,
-      skillId: payload.skillId ?? null,
-      ...(payload.skillCatalogScope
+      ...strategyRoutingFields,
+      ...(strategyRoutingFields.skillId && payload.skillCatalogScope
         ? { skillCatalogScope: payload.skillCatalogScope }
         : {}),
       designSystemId: payload.designSystemId ?? null,
@@ -1462,13 +1467,18 @@ export function EntryShell({
         : {}),
       metadata,
       pendingPrompt: payload.prompt,
-      ...(payload.pluginId ? { pluginId: payload.pluginId } : {}),
-      ...(payload.pluginSource ? { pluginSource: payload.pluginSource } : {}),
-      ...(payload.pluginType ? { pluginType: payload.pluginType } : {}),
-      ...(payload.appliedPluginSnapshotId
+      ...(payload.pluginId && !payload.pluginSelectionProvenance
+        ? { pluginId: payload.pluginId }
+        : {}),
+      ...(payload.pluginSource && !payload.pluginSelectionProvenance
+        ? { pluginSource: payload.pluginSource }
+        : {}),
+      ...(payload.pluginType && !payload.pluginSelectionProvenance
+        ? { pluginType: payload.pluginType }
+        : {}),
+      ...(payload.appliedPluginSnapshotId && !payload.pluginSelectionProvenance
         ? { appliedPluginSnapshotId: payload.appliedPluginSnapshotId }
         : {}),
-      ...(payload.pluginInputs ? { pluginInputs: payload.pluginInputs } : {}),
       ...(payload.initialRunContext ? { initialRunContext: payload.initialRunContext } : {}),
       ...(payload.conversationMode ? { conversationMode: payload.conversationMode } : {}),
       ...(payload.attachments && payload.attachments.length > 0
@@ -1613,9 +1623,9 @@ export function EntryShell({
           onOpenSearch={() => setProjectSearchOpen(true)}
           open={railOpen}
           topRightSlot={
-            topRightCampaignKind ? (
+            topRightCampaignAudience ? (
               <WorkbenchCampaignBadge
-                kind={topRightCampaignKind}
+                audience={topRightCampaignAudience}
                 page="home"
                 metricsConsent={config.telemetry?.metrics === true}
                 installationId={config.installationId}
@@ -1715,7 +1725,7 @@ export function EntryShell({
                 promptTemplates={promptTemplates}
                 executionSwitcher={view === 'home' ? homeExecutionSwitcher : undefined}
                 artifactUpgradeSlot={artifactUpgradeSlot}
-                deepSeekV4FlashCampaignAudience={homeCampaignModalAudience}
+                deepSeekV4FlashCampaignAudience={deepSeekV4FlashCampaignAudience}
                 onDeepSeekV4FlashCampaignUseNow={applyDeepSeekCampaignModel}
                 deepSeekV4FlashCampaignMetricsConsent={config.telemetry?.metrics === true}
                 deepSeekV4FlashCampaignInstallationId={config.installationId ?? null}
