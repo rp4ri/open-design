@@ -28,6 +28,7 @@ import {
   composeOdNextStrategyStableRequestContextV2,
   executionProfileFromStreamFormat,
   PLUGIN_SHARE_ACTION_PLUGIN_IDS,
+  resolveOdNextDeckFrameworkMode,
 } from '@open-design/contracts';
 import { isTodoWriteToolName, stopReasonIsTruncation, todoItemsFromTodoWriteInput } from '@open-design/contracts';
 import type {
@@ -162,6 +163,7 @@ import {
   resolveRunProjectKindForAnalytics,
   retryFinalResultForRunStatus,
   runArtifactCountForRun,
+  runAdmissionEvidenceForRun,
   runDesignSystemCreatedForRun,
   runFilesWrittenForRun,
   runPreviewModuleCountForRun,
@@ -10092,11 +10094,48 @@ export async function startServer({
     const odNextLayoutPrimitivesCss = odNextStrategyRecipe?.taskType === 'prototype'
       ? selectOdNextLayoutPrimitivesCss(odNextStrategyRecipe.taskResources)
       : null;
+    const odNextDeckIntent = odNextStrategyRecipe?.taskType !== 'ppt'
+      && freeformDeckSignal === true;
+    const isOdNextDeckRequest = odNextStrategyRecipe?.taskType === 'ppt'
+      || odNextDeckIntent;
+    const hasSelectedDeckSeed = odNextStrategyRecipe?.taskType === 'ppt' && Boolean(
+      template?.files?.some((file) => /\.html?$/i.test(file.name))
+      || /(?:^|\/)assets\/template\.html\b/i.test(skillBody ?? '')
+      || frozenSkillPackage?.selections?.some((selection) =>
+        /(?:^|\/)assets\/template\.html\b/i.test(selection.body)
+        || selection.files.some((file) => /(?:^|\/)assets\/template\.html$/i.test(file.path)),
+      ),
+    );
+    let hasExistingDeckArtifact = false;
+    if (
+      odNextStrategyRecipe?.taskType === 'ppt'
+      && typeof projectId === 'string'
+      && projectId
+    ) {
+      try {
+        const files = await listFiles(PROJECTS_DIR, projectId, { metadata });
+        hasExistingDeckArtifact = files.some((file) => /\.html?$/i.test(file.name));
+      } catch {
+        // Inventory failure must not authorize replacing a potentially legacy
+        // deck. The later project setup reports the underlying filesystem issue.
+        hasExistingDeckArtifact = true;
+      }
+    }
+    const odNextDeckFrameworkMode = isOdNextDeckRequest && odNextStrategyRecipe
+      ? resolveOdNextDeckFrameworkMode({
+          taskType: odNextStrategyRecipe.taskType,
+          deckIntent: odNextDeckIntent,
+          hasSelectedDeckSeed,
+          hasExistingDeckArtifact,
+        })
+      : undefined;
     const odNextStableRequestContext = odNextStrategyRecipe
       ? {
           agentId,
           streamFormat,
           executionProfile: executionProfileFromStreamFormat(streamFormat),
+          deckIntent: odNextDeckIntent,
+          deckFrameworkMode: odNextDeckFrameworkMode,
           metadata,
           template,
           exampleReference: odNextExampleReference,
@@ -10136,6 +10175,8 @@ export async function startServer({
           exampleReference: odNextExampleReference,
           deviceFrame: odNextDeviceFrame,
           layoutPrimitivesCss: odNextLayoutPrimitivesCss,
+          deckIntent: odNextDeckIntent,
+          deckFrameworkMode: odNextDeckFrameworkMode,
           designSystemBody,
           designSystemTitle,
           craftBody,
@@ -10173,7 +10214,10 @@ export async function startServer({
       odNextRecipeIdentity,
       odNextRuntimeFacts,
       odNextStableContextPrompt: odNextStableRequestContext
-        ? composeOdNextStrategyStableRequestContextV2(odNextStableRequestContext)
+        ? composeOdNextStrategyStableRequestContextV2(
+            odNextStableRequestContext,
+            odNextStrategyRecipe?.executionProfile ?? 'filesystem',
+          )
         : '',
       activeSkillDir,
       activeSkillDirs: odNextStrategyRecipe ? [] : activeSkillDirs,
@@ -12081,6 +12125,7 @@ export async function startServer({
         cancelOrigin: run.cancelOrigin ?? null,
         terminalTrigger: run.terminalTrigger ?? null,
         events: run.events,
+        admissionEvidence: runAdmissionEvidenceForRun(run),
       });
       if (
         result === 'failed' &&
@@ -14241,6 +14286,23 @@ export async function startServer({
       plaintextStdoutBuffer.length = 0;
       return true;
     };
+    const flushBufferedPlaintextStdout = () => {
+      // Stamp from the first chunk's arrival only once the buffer is known to
+      // be visible; suppressed OAuth prompts must never report a first token.
+      if (plaintextStdoutBuffer.length > 0 && firstBufferedStdoutAt !== null) {
+        noteFirstTokenAt(firstBufferedStdoutAt);
+      }
+      for (const chunk of plaintextStdoutBuffer) {
+        const strippedText = visibleStdoutControlStripper.write(chunk.text);
+        const visibleText = titleMarkerStripper.strip(strippedText);
+        if (visibleText) send('stdout', { chunk: visibleText });
+      }
+      const flushedControlText = visibleStdoutControlStripper.flush();
+      const flushedTitleMarkerText =
+        titleMarkerStripper.strip(flushedControlText) + titleMarkerStripper.flush();
+      if (flushedTitleMarkerText) send('stdout', { chunk: flushedTitleMarkerText });
+      plaintextStdoutBuffer.length = 0;
+    };
     const publishRuntimeChildEvidenceCoverage = (coverage) => {
       if (!strategyTaskAtStart || !coverage) return;
       sendAgentEvent({
@@ -15226,6 +15288,11 @@ export async function startServer({
           runArtifactSideEffects.artifactWriteSeen ||
           runArtifactSideEffects.liveArtifactSeen,
       });
+      // Authentication guards above have now ruled out Antigravity's OAuth
+      // prompt. Publish any remaining guarded plaintext before a close error
+      // so both the emit-time admission ledger and durable-log reconciliation
+      // observe the genuine assistant response before the terminal boundary.
+      flushBufferedPlaintextStdout();
       // Skip the close-handler failure emit when the run is already
       // terminal: the inactivity watchdog (failForInactivity) finishes the
       // run — sending its error and clearing run.clients/eventsLogStream —
@@ -15335,25 +15402,6 @@ export async function startServer({
           } catch { /* project-level best-effort */ }
         })();
       }
-      // Flush buffered plain-text stdout (antigravity) that was not
-      // suppressed by the auth-prompt guard above. Send each chunk in
-      // order before finishing so the assistant text arrives before the
-      // run's `finished` event. Stamp first-token timing here — and only
-      // here — using the first chunk's arrival time, so the OAuth-prompt
-      // path (which returns before this flush) never records a TTFT for
-      // output the user never saw (PR #3412).
-      if (plaintextStdoutBuffer.length > 0 && firstBufferedStdoutAt !== null) {
-        noteFirstTokenAt(firstBufferedStdoutAt);
-      }
-      for (const chunk of plaintextStdoutBuffer) {
-        const strippedText = visibleStdoutControlStripper.write(chunk.text);
-        const visibleText = titleMarkerStripper.strip(strippedText);
-        if (visibleText) send('stdout', { chunk: visibleText });
-      }
-      const flushedControlText = visibleStdoutControlStripper.flush();
-      const flushedTitleMarkerText =
-        titleMarkerStripper.strip(flushedControlText) + titleMarkerStripper.flush();
-      if (flushedTitleMarkerText) send('stdout', { chunk: flushedTitleMarkerText });
       if (
         status === 'succeeded' &&
         (def.streamFormat ?? 'plain') === 'plain' &&
