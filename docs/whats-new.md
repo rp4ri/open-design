@@ -7,15 +7,24 @@ if the source is unreachable or empty, no card shows and Home is unaffected.
 
 ## Where the content lives
 
-The card content is a single hand-curated JSON document on a dedicated R2
-bucket:
+The card content is a single hand-curated JSON document, kept in this
+repository at:
+
+```
+docs/whats-new.json
+```
+
+`.github/workflows/whats-new-publish.yml` publishes that file to the object the
+daemon reads:
 
 ```
 https://whatsnew.open-design.ai/whats-new.json
 ```
 
-There is **no per-release publish tooling** and the content is **not** carried
-in release `metadata.json`. To change what users see, edit that one file.
+Changing the card is therefore an ordinary pull request — no local Cloudflare
+credentials, no wrangler, no per-person bottleneck. The content is **not**
+carried in release `metadata.json`, and there is no per-release publish
+tooling: one file, edited when the copy should change.
 
 - The daemon proxies it at `GET /api/whats-new` (also `od whats-new [--json]`),
   so the web UI and CLI read the exact same payload.
@@ -40,8 +49,11 @@ card when the current `id` differs. So:
   document is deliberately curated, so surfacing the current highlight to a new
   user once is intended.
 
-To retire the card entirely, publish an empty object (`{}`) or a document
-without a valid `id`/`title`/`body`; the daemon then resolves to "no highlight".
+To retire the card entirely, publish an empty object (`{}`); the daemon then
+resolves to "no highlight". Any *other* incomplete document also resolves to
+"no highlight", but that is the accident case, not the intended one — the guard
+accepts only a complete highlight or the empty document, so taking the card
+down is an explicit act rather than something a typo can do for you.
 
 ## Document schema
 
@@ -62,8 +74,9 @@ without a valid `id`/`title`/`body`; the daemon then resolves to "no highlight".
 }
 ```
 
-Field rules (anything missing or malformed makes the card silently not show, so
-validate before uploading):
+Field rules — anything missing or malformed makes the card silently not show,
+which is why `pnpm guard` checks the repository document against the shipping
+parser rather than trusting review:
 
 - `id` — **required**, non-empty string. The show-once key.
 - `title`, `body` — **required**, non-empty strings.
@@ -74,16 +87,68 @@ validate before uploading):
   `zh-CN`, …); each may override `title`/`body`/`linkUrl`. An exact locale wins,
   then the bare language (`zh` for `zh-TW`), then the base fields.
 
-## Updating the file (S3 API)
+## Updating the card
 
-The bucket is S3-compatible. With an R2 token scoped to the bucket:
+1. Edit `docs/whats-new.json` and open a pull request.
+2. `pnpm guard` validates the document on every PR
+   (`scripts/check-whats-new-document.ts`). It runs the document through the
+   daemon's own parser and fails if the card would not show, if an optional
+   field would be silently dropped, or if a field name is misspelled. This
+   matters because the runtime is fail-safe: a malformed document does not
+   error, it just makes the card disappear.
+3. On merge to `main`, `whats-new-publish.yml` uploads the file
+   (`application/json`, `cache-control: public, max-age=300`) and then reads it
+   back from `https://whatsnew.open-design.ai/whats-new.json` with the edge
+   cache bypassed. The job fails unless the bytes served match the bytes
+   uploaded — an exit code from the upload alone is not treated as proof.
 
-```bash
-AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
-aws s3 cp whats-new.json s3://<bucket>/whats-new.json \
-  --endpoint-url https://<account>.r2.cloudflarestorage.com \
-  --content-type application/json --cache-control 'public, max-age=300'
-```
+Republishing the current `main` content without a code change: run the
+**whats-new-publish** workflow manually (`workflow_dispatch`) against `main`.
+Its `dry_run` input validates the document and reports the live-vs-proposed
+`id` without uploading; a dry run needs no credentials and works from any
+branch, so it is a safe way to preview a copy change before it merges. A real
+publish only runs on `main` — see the trust boundary below.
 
-Keep `Cache-Control` modest so an edit reaches users promptly; the daemon also
-caches the document for ~10 minutes.
+Propagation takes up to ~15 minutes: the object's own `max-age=300` plus the
+daemon's ~10 minute in-process cache.
+
+### Credentials and the trust boundary
+
+The card is visible to every installed client as soon as it lands, so
+"published" has to imply "reviewed". The control that guarantees it is the
+**`whats-new-publish` GitHub environment**:
+
+- its deployment-branch policy allows **`main` only**, so a job that declares
+  the environment cannot start on any other ref;
+- the R2 credentials are **environment secrets on that environment** —
+  `CLOUDFLARE_R2_WHATS_NEW_AK`, `CLOUDFLARE_R2_WHATS_NEW_SK`,
+  `CLOUDFLARE_R2_WHATS_NEW_URL`, `CLOUDFLARE_R2_WHATS_NEW_BUCKET`.
+
+Both halves are load-bearing. `workflow_dispatch` runs the workflow file from
+the ref it is dispatched against, so every check written inside the workflow is
+editable by whoever triggers it — including the `main`-only assertion. What is
+not editable is where the secrets live: dropping the `environment:` declaration
+to escape the branch policy also drops access to the secrets, and the publisher
+then fails naming the variables it is missing.
+
+**Do not add these as repository secrets.** Repository secrets are readable
+from any job on any branch, which would let anyone with write access publish
+unreviewed content by dispatching a modified workflow from their own branch.
+
+That shape is pinned by the `what's new publish workflow` check in `pnpm guard`
+(`scripts/check-whats-new-publish-workflow.ts`): the credential-bearing job is
+the one that declares the environment, it cannot start without a green
+`validate`, and no other job may hold an environment or read a secret. The
+check runs from CI's unconditional preflight job rather than a path-routed
+test lane, because an edit to the workflow alone selects no test workload —
+a lane-routed assertion would be skipped for exactly the edit it guards.
+
+It reads the workflow through a YAML parser rather than matching text, and
+looks for the `secrets` **context identifier** inside any `${{ … }}`
+expression rather than for particular access shapes. Both choices are
+load-bearing: `secrets['NAME']`, `toJSON(secrets)` and a bare `secrets` are all
+secret reads, and a double-quoted YAML scalar can hide `secrets` from raw text
+entirely by splitting it across a backslash line continuation.
+
+The repository-wide `CLOUDFLARE_API_TOKEN` is a Pages-scoped token and cannot
+reach R2 at all; do not route this publish through it.
