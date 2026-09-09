@@ -8,6 +8,7 @@ import {
   upwardGestureCanEscapeBottom,
   type FollowIntent,
   type ScrollSample,
+  type WheelWitness,
 } from '../runtime/chat/stick-to-bottom';
 import {
   ANCHOR_TOP_PADDING,
@@ -64,6 +65,12 @@ import {
   runAgentProviderId,
 } from '../analytics/run-task';
 import { amrHandoffDeviceId, attributedAmrUrl, recordAmrEntry } from '../analytics/amr-attribution';
+import { setChatCorrelation } from '../observability/chat-context';
+import {
+  chatSurfaceSample,
+  openChatSurface,
+  type ChatSurfaceHandle,
+} from '../observability/chat-health';
 import { useI18n, useT } from '../i18n';
 import { startersForProduct, type ProductType } from '../onboarding/recommendation';
 import { starterCopyFor } from '../onboarding/starter-copy';
@@ -176,12 +183,17 @@ import {
   RunErrorCard,
   RunErrorCardAction,
   RunErrorCardActionGroup,
+  RunErrorCardBlockedNote,
 } from './chat/RunErrorCard';
 import { UpgradeCard } from './chat/UpgradeCard';
 import { SupportDialog } from './chat/SupportDialog';
 import { Toast } from './Toast';
 import { supportChannels } from './chat/support-channels';
 import { ExportLogsAction } from './chat/ExportLogsAction';
+import {
+  recoveryActionBlockMessageKey,
+  type RecoveryActionBlockReason,
+} from '../runtime/chat/recovery-gating';
 import { repoConnectCopy } from './design-system-github-evidence';
 import { isRenderableSketchJson, SketchPreview } from './SketchPreview';
 import type { SettingsSection } from './SettingsDialog';
@@ -661,6 +673,25 @@ interface Props {
     assistantMessage: ChatMessage,
     recoveryActionType?: TrackingRunRecoveryActionType,
   ) => void;
+  /**
+   * 宿主这一刻**为什么**接不住报错卡上的恢复动作(OPEND-2821)。
+   *
+   * `null` = 接得住。非 null 的时候这一排按钮长成禁用态,卡面上多一句说明 ——
+   * 在此之前宿主的 `handleRetry` 在同样的六个条件下静默 `return`,而按钮
+   * 一直画成可点的样子。判据出自 `runtime/chat/recovery-gating.ts`,
+   * 宿主和按钮读的是同一个值。
+   */
+  recoveryActionsBlockedReason?: RecoveryActionBlockReason | null;
+  /**
+   * **哪一轮正在被重试**,而新的 run 还没得到服务端确认(OPEND-2758)。
+   *
+   * 宿主一按下重试就把这条失败助手消息的 id 挂在这里,直到 `POST /api/runs`
+   * 回来(或者这一发根本没起来)才撤掉。这段时间里报错卡**钉在这条消息上**:
+   * 提前上屏(OPEND-2614)已经把队尾换成了新的运行中助手消息,
+   * `retryableAssistantMessage` 会立刻返回 null,卡当场消失 —— 用户既看不到
+   * 重试有没有被接收,也没法再读一遍失败原因。
+   */
+  retryPendingAssistantId?: string | null;
   /** Retry a user message whose daemon run was never created. */
   onResendUserMessage?: (message: ChatMessage) => void;
   amrAuthRetryContinuation?: AmrAuthRetryContinuation | null;
@@ -1009,6 +1040,14 @@ interface QueuedSendUpdate {
  * folded. Every continuation's content, events and produced files are appended
  * to the turn's first message in Run order, so nothing is dropped and nothing
  * is duplicated.
+ *
+ * ⚠️ The turn keeps ONE message row, so it can carry only one `createdAt` and
+ * one `endedAt` — the head's start and the tail's end. Every Run boundary in
+ * between used to die here, and the renderer's clocks died with it
+ * (OPEND-2823 / OPEND-2824; the full causal chain is on
+ * `PersistedAgentEvent`'s `done_key.runStartedAt`). So each Run's own span is
+ * stamped onto the `done_key` it already emits — the very event the renderer
+ * uses to find the boundary — before its events are appended.
  */
 export function foldStrategyTaskTurns(messages: ChatMessage[]): ChatMessage[] {
   if (!messages.some((message) => (message.strategyTaskRunIndex ?? 0) > 0)) {
@@ -1025,7 +1064,7 @@ export function foldStrategyTaskTurns(messages: ChatMessage[]): ChatMessage[] {
     }
     if (runIndex === 0 || !turnHeadIndexByTask.has(taskId)) {
       turnHeadIndexByTask.set(taskId, folded.length);
-      folded.push(message);
+      folded.push({ ...message, events: stampRunSpan(message) });
       continue;
     }
     const headIndex = turnHeadIndexByTask.get(taskId)!;
@@ -1037,7 +1076,7 @@ export function foldStrategyTaskTurns(messages: ChatMessage[]): ChatMessage[] {
       content: tailContent
         ? `${headContent}${headContent && !headContent.endsWith('\n') ? '\n\n' : ''}${tailContent}`
         : headContent,
-      events: [...(head.events ?? []), ...(message.events ?? [])],
+      events: [...(head.events ?? []), ...stampRunSpan(message)],
       producedFiles: [...(head.producedFiles ?? []), ...(message.producedFiles ?? [])],
       // The turn's status is the latest Run's: the earlier Runs finishing is an
       // internal step, not the turn ending.
@@ -1055,6 +1094,32 @@ export function foldStrategyTaskTurns(messages: ChatMessage[]): ChatMessage[] {
     };
   }
   return folded;
+}
+
+/**
+ * Write this Run's own wall-clock span onto the `done_key` it already carries.
+ *
+ * The message row is about to be merged away, and with it the only record of
+ * when THIS Run started and ended. `done_key` is emitted once per Run and is
+ * where the renderer already splits Runs apart, so the span rides along with
+ * the boundary it belongs to instead of needing a channel of its own.
+ *
+ * A Run still in flight has no `endedAt`; a Run recorded before `done_key`
+ * existed has no marker to stamp. Both simply keep today's behaviour — the
+ * renderer treats an absent span as "unknown" and falls back to the turn's.
+ */
+function stampRunSpan(message: ChatMessage): NonNullable<ChatMessage['events']> {
+  const events = message.events ?? [];
+  if (message.createdAt == null && message.endedAt == null) return events;
+  return events.map((event) => (
+    event.kind === 'done_key'
+      ? {
+        ...event,
+        ...(message.createdAt != null ? { runStartedAt: message.createdAt } : {}),
+        ...(message.endedAt != null ? { runEndedAt: message.endedAt } : {}),
+      }
+      : event
+  ));
 }
 
 function shouldHideEmptyBrandAssistantMessage(message: ChatMessage, metadata?: ProjectMetadata): boolean {
@@ -1276,6 +1341,8 @@ export function ChatPane({
   onDeleteComment,
   onSend,
   onRetry,
+  recoveryActionsBlockedReason = null,
+  retryPendingAssistantId = null,
   onResendUserMessage,
   amrAuthRetryContinuation = null,
   amrAuthRetryMountId,
@@ -1406,6 +1473,20 @@ export function ChatPane({
    * 只是此刻长得一样。见 `buildChatRenderItems` 的注释。
    */
   const chatRenderItems = useMemo(() => buildChatRenderItems(displayMessages), [displayMessages]);
+  /** Live handle on the chat-health surface, for the effects that feed it. */
+  const chatSurfaceRef = useRef<ChatSurfaceHandle | null>(null);
+  const chatVirtualized = isChatVirtualized(chatRenderItems);
+  /**
+   * 这场对话背后**agent 事件的总条数**。
+   *
+   * 首屏耗时单独一个数字是没法归因的:3 秒到底是「消息多」还是「每条消息底下
+   * 挂了几百条工具事件」,只有这个数能分开。所以它和 `markFirstPaint` 必须同批
+   * 落地 —— 只有耗时没有它,那个耗时就只是个不能下钻的读数。
+   */
+  const chatStreamEventCount = useMemo(
+    () => displayMessages.reduce((total, message) => total + (message.events?.length ?? 0), 0),
+    [displayMessages],
+  );
   /**
    * 每一轮各自那张升级卡:key = 那一轮助手消息的 id,value = **结束那一刻**的余额。
    *
@@ -1562,6 +1643,29 @@ export function ChatPane({
     scrollHeight: 0,
     clientHeight: 0,
   });
+  /**
+   * 「就在这个位置上,用户的滚轮在朝下要」——一张**只解释一次位移**的证词。
+   *
+   * 唯一的用途是给 `nextFollowIntent` 一个否决权:朝下的滚轮配上朝上的位移不是
+   * 用户上滑(见 `stick-to-bottom.ts` 的 `isCompositorSnapBack`)。
+   *
+   * ## ⚠️ 生命周期是这张条子的安全性所在
+   *
+   * 一张能解释任意后续位移的条子会把跟随焊死 —— 那比它要修的 bug 更糟。三条边界
+   * 各自堵一个别的堵不住的洞,缺一不可:
+   *
+   *  1. **用掉就清**(`onScroll`)—— 一次位移一张条子,不许连用。
+   *  2. **上下文换了就清**(切会话、日志节点换掉、面板卸载,以及滚轮之外的输入)
+   *     —— 结构性的那一半;`atScrollTop` 在判据里再兜一层。
+   *  3. **过一帧就过期**(`armWheelWitnessExpiry`)—— 唯一能堵住「一格朝下的滚轮
+   *     落在已经到底的日志上,位置不动、连 scroll 事件都不发」的洞:那张条子
+   *     没人来用掉,得自己死。
+   *
+   * `null` = 没有见证 = 判据退回「方向 + 几何」,也就是这套东西出现之前的行为。
+   */
+  const wheelWitnessRef = useRef<WheelWitness | null>(null);
+  /** (3) 的那一帧。挂着的时候说明有一张条子在等着过期。 */
+  const wheelWitnessFrameRef = useRef<number | null>(null);
   const scrolledToFormRef = useRef<Set<string>>(new Set());
   const refreshInlineAmrLoginStatus = useCallback(async (options: { refresh?: boolean } = {}) => {
     const next = await fetchVelaLoginStatus(options).catch(() => null);
@@ -1966,12 +2070,52 @@ export function ChatPane({
    */
   const showJumpToLatest = scrolledFromBottom;
   const planPillVisible = planPillEligible && !scrolledFromBottom;
-  const retryAssistant = retryableAssistantMessage(
+  /**
+   * 重试在飞时,报错卡**钉在被重试的那一轮上**(OPEND-2758)。
+   *
+   * `retryableAssistantMessage` 的锚点是队尾且要求面板不在流式 —— 两个条件在
+   * 点下重试的同一帧里就同时失效了:提前上屏(OPEND-2614)把新的运行中助手
+   * 消息接在队尾,`markStreamingConversation` 把面板置成流式。于是卡在
+   * **服务端还没确认这一发**的时候就消失,单里说的「无法判断重试是否已被接收,
+   * 也无法继续查看原失败原因」正是这一段。
+   *
+   * 钉的是宿主点名的那条消息,而且**它必须仍然是一条终态失败的助手消息** ——
+   * 重试那一路会把它原样留在流水里(`resolveRetryTarget.preservedAttempts`),
+   * 所以这份查找是有主的;查不到就退回原来的判据,不硬造一张卡。
+   */
+  const pinnedRetryAssistant = retryPendingAssistantId
+    ? displayMessages.find(
+        (message) =>
+          message.id === retryPendingAssistantId
+          && message.role === 'assistant'
+          && isRetryableAssistantTerminalFailure(message),
+      ) ?? null
+    : null;
+  const retryAssistant = pinnedRetryAssistant ?? retryableAssistantMessage(
     displayMessages,
     lastAssistantId,
     streaming,
     lastTurnAssistantId,
   );
+  /** 这一轮的重试已经发出去,但还没有 run 可言 —— 按钮进加载态并锁住。 */
+  const retryInFlight = pinnedRetryAssistant !== null;
+  /**
+   * 报错卡上那一排恢复动作**这一刻能不能按**。
+   *
+   * 两个来源:宿主说它接不住(2821 的六个门控),或者这一轮的重试已经在飞
+   * (2758 的防重复提交)。两者都只影响**可用态**,不影响这一排出不出现 ——
+   * 用户仍要能读到失败原因和有哪些出路。
+   */
+  const recoveryActionsDisabled = recoveryActionsBlockedReason !== null || retryInFlight;
+  /**
+   * 〔重试〕这一颗在飞的时候改说「正在重试」。
+   *
+   * 复用 `chat.edge.retrying` —— 流水最后一行那枚重连行说的就是同一件事
+   * (`chat/Reconnect.tsx` 的 `agent-retry`),不另造一份措辞。
+   */
+  const retryLabelKey: keyof Dict = retryInFlight
+    ? 'chat.edge.retrying'
+    : 'promptTemplates.retry';
   // The failed run's error event lives on the (persisted) assistant message, so
   // the error card + AMR card survive a reload — unlike the ephemeral global
   // `error` state. Drive both off this event.
@@ -2556,6 +2700,21 @@ export function ChatPane({
       area: 'chat_panel',
       element: 'run_failed_toast',
       error_code: failedRunErrorEvent.code,
+      /*
+       * 卡上那句话**到底是哪一句**,以及它是不是兜底那句。
+       *
+       * `error_code` 回答的是「daemon 说这是什么错」,回答不了「用户读到了什么」——
+       * 这两件事之间隔着一张映射表,而映射表**总会少一行**
+       * (`resolveRunErrorCardDescription` 的注释把这件事写死了:表可以短一行,
+       * 判据不能)。少那一行的时候用户看到的是一句空洞的「任务失败了」,
+       * 这正是最该被量出来的一格。
+       *
+       * 判据现成:`runFailureUi.messageKey` 为 null 就是「表里没有这条文案」
+       * (`amr-guidance.ts` 的 `RunErrorCardDescription`)。
+       * 兜底那一格**必须有自己的值而不是缺字段** —— 缺了,兜底率的分母就没了。
+       */
+      message_key: runFailureUi?.messageKey ?? 'generic_fallback',
+      failure_category: failedRunErrorEvent.failureCategory ?? 'unknown',
       project_id: projectId ?? '',
       project_kind: projectKindForTracking,
       conversation_id: activeConversationId,
@@ -2567,9 +2726,11 @@ export function ChatPane({
     analytics.track,
     displayError,
     failedRunErrorEvent?.code,
+    failedRunErrorEvent?.failureCategory,
     projectId,
     projectKindForTracking,
     retryAssistant,
+    runFailureUi?.messageKey,
   ]);
   const importedFolderArtifacts = useMemo(
     () =>
@@ -2645,6 +2806,25 @@ export function ChatPane({
      */
     armFollow();
     lastScrollSampleRef.current = { scrollTop: 0, scrollHeight: 0, clientHeight: 0 };
+    /*
+     * 滚轮见证是**这条会话这个位置**上的证词,跟着基线和跟随意图一起归位。
+     *
+     * 漏掉它会漏出一条完整的路(nettee 在 #7898 上点名的):用户已经在底部,
+     * 再往下拨一格 —— 位置不动,不发 scroll 事件,条子没人用掉;从历史记录切换
+     * 会话的那次点击发生在**日志元素之外**,一个 pointerdown 都收不到;新会话
+     * 定位好之后一次页内查找跳到前面,就撞上那张旧条子,被判成夹取,跟随不释放。
+     *
+     * ⚠️ 【实测交待】这一行**单独撤掉,现有测试不会变红**,原因清楚:换会话必然
+     * 会排一帧(初次定位那条 effect 会 `armFollow()` 并贴底),那一帧一跑,过期
+     * 边界就已经把条子杀了;就算帧没跑,基线也就没被刷新,判据里的 `atScrollTop`
+     * 同样对不上。也就是说评审点的这个洞今天是被那两条堵住的。
+     *
+     * 留着它不是保险起见,是**作用域声明**:见证属于「这条会话的这个位置」,
+     * 上下文边界该由上下文自己划。那两条一条是时间的、一条是判据时刻的,谁先
+     * 松一点(比如哪天给 `atScrollTop` 加个亚像素容差 —— 这个仓库到处是 8px 容差)
+     * 这一行就是唯一还站着的。
+     */
+    resetWheelWitness();
   }, [activeConversationId]);
 
   // ChatComposer's internal `seededRef` latches after the first
@@ -2743,10 +2923,83 @@ export function ChatPane({
     });
   };
 
+  /*
+   * 这块面板此刻在显示**哪个项目的哪场对话**。
+   *
+   * 设在 ChatPane 自己身上,而不是某一个宿主里 —— 同一个组件挂在三处:
+   * `ProjectView`、`DesignSystemFlow`、`workspace/SideChatTab`。只在其中一处设,
+   * 另外两处发出去的每一条 `client_chat_*` 都是没有项目、没有会话的孤儿事件,
+   * 而三处用的是同一套观测模块、同一块看板。这两个 id 早就作为 props 递进来了,
+   * 组件边界才是它们共同的、唯一的落点。
+   *
+   * 必须排在下面那条 openChatSurface 的 effect **前面**:开面时那一发
+   * `conversation_open` 取样会展开这个块,晚一步它就是空的。
+   */
+  useEffect(() => {
+    setChatCorrelation({
+      conversation_id: activeConversationId ?? undefined,
+      project_id: projectId ?? undefined,
+    });
+  }, [activeConversationId, projectId]);
+
+  /*
+   * 把这块转录交给 chat-health 看着(`client_chat_first_paint` /
+   * `client_chat_dom_growth` / `client_chat_memory_pressure` /
+   * `client_chat_stream_health` 四条的宿主)。
+   *
+   * 依赖只有两项,各自防一个真实的死法:
+   *   - `tab`:不是聊天页时整块是条件渲染的,`logRef.current` 是 null。
+   *     漏了它,从别的页回到聊天页永远接不上观察者。
+   *   - `activeConversationId`:那个 div **不带 conversation key**,换会话
+   *     React 复用同一个 DOM 节点。所以「换会话要重开」这件事没有任何
+   *     节点层面的信号,只能靠这条依赖。
+   *
+   * `openChatSurface` 自己会先 detach 上一块再建新的,cleanup 再 detach 一次
+   * 是幂等的 —— 两套观察者并存这件事在模块那一侧就已经不可能。
+   */
+  useEffect(() => {
+    if (tab !== 'chat') return undefined;
+    const el = logRef.current;
+    if (!el) return undefined;
+    const handle = openChatSurface({
+      element: el,
+      messageCount: displayMessages.length,
+      virtualized: chatVirtualized,
+      streamEventCount: chatStreamEventCount,
+    });
+    chatSurfaceRef.current = handle;
+    // 开局先取一个基线。没有它,DOM/heap 曲线的第一个点要等 60 秒的定时器,
+    // 而「打开就已经很大」和「开着开着长大了」是两个不同的故事。
+    chatSurfaceSample('conversation_open');
+    return () => {
+      chatSurfaceRef.current = null;
+      handle.detach();
+    };
+    // 计数由下面那条 effect 持续推给 handle;这里只认「换会话 / 换标签页」
+    // 这两件真的需要换一块被观察对象的事。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversationId, tab]);
+
+  useEffect(() => {
+    const handle = chatSurfaceRef.current;
+    if (!handle) return;
+    handle.setMessageCount(displayMessages.length);
+    handle.setVirtualized(chatVirtualized);
+    handle.setStreamEventCount(chatStreamEventCount);
+  }, [chatStreamEventCount, chatVirtualized, displayMessages.length]);
+
   useEffect(() => {
     const el = logRef.current;
     if (!el || didInitialScrollRef.current || displayMessages.length === 0) return;
     didInitialScrollRef.current = true;
+    // 第一条消息在屏幕上了 —— 这才是「用户读得到」的那一刻,也是首屏耗时的
+    // 终点。模块自己保证幂等(只有第一次会上报),所以 StrictMode 的双跑
+    // 造不出一个假的、更快的样本。
+    // 行数按 chat-health 自己数 `dom_growth` 那一套算(日志容器的直接子元素),
+    // 两个事件用同一个定义,才比得起来。
+    chatSurfaceRef.current?.markFirstPaint({
+      renderedRowCount: el.querySelectorAll(':scope > *').length,
+    });
     requestAnimationFrame(() => {
       // If the last assistant message contains a question form, scroll to
       // the form instead of the bottom, so the user sees the form first.
@@ -3002,8 +3255,12 @@ export function ChatPane({
         followIntentRef.current,
         lastScrollSampleRef.current,
         sample,
+        wheelWitnessRef.current,
       );
       lastScrollSampleRef.current = sample;
+      // 见证是一次性的:它只为**这一段**位移作数。留到下一段就可能替一次真正的
+      // 用户上滑背书 —— 那是把跟随焊死,比它要修的 bug 更糟。
+      resetWheelWitness();
       snapshot(target);
       // `syncFollowState` 里的函数式更新在值没变时原地返回,所以流式期间那一串
       // scroll 事件不会每一跳都排一次重渲,也就不会撞上 React 的
@@ -3041,6 +3298,13 @@ export function ChatPane({
     function onWheel(event: WheelEvent) {
       const target = logRef.current;
       if (!target) return;
+      /*
+       * 先记方向,再走下面的早退 —— 朝下的滚轮在这一条里什么都不做,可它正是
+       * 合成器夹取的**触发者**:真机实测「`scrollTop = 800`,一格朝下的滚轮,
+       * 位置被甩到 91」(`observability/chat-scroll-freeze-detector.ts` 的抬头)。
+       * 记漏了,随之而来的那次「位置变小」就还是会被读成用户上滑。
+       */
+      recordWheelWitness(target, event.deltaY);
       if (event.deltaY >= 0) return;
       /*
        * 判据是**这一格有没有可能真的离开底部**,不是「有没有发生一次滚轮手势」。
@@ -3078,11 +3342,26 @@ export function ChatPane({
       }
     }
 
+    /*
+     * 滚轮之外的每条输入通道,一动就把滚轮见证作废。
+     *
+     * 见证平时由 scroll 事件用掉。但滚轮**打不动**这个框的时候(合成器卡住的
+     * 那一档,真机实测「12 格朝下的滚轮要 1440px,停在 91 一动不动」)一个
+     * scroll 事件都不会发,见证就留在那儿。这时用户改用滚动条或键盘往上走,
+     * 那次位移会撞上一个陈旧的「滚轮在朝下要」见证 —— 一次真正的用户上滑被吞掉。
+     * 这两条监听把那个窗口关掉。
+     */
+    function onOtherInput() {
+      resetWheelWitness();
+    }
+
     rememberScrollSample(el);
     el.addEventListener('scroll', onScroll);
     el.addEventListener('wheel', onWheel, { passive: true });
     el.addEventListener('touchstart', onTouchStart, { passive: true });
     el.addEventListener('touchmove', onTouchMove, { passive: true });
+    el.addEventListener('pointerdown', onOtherInput, { passive: true });
+    el.addEventListener('keydown', onOtherInput, { passive: true });
     return () => {
       // Capture final scroll state before unmount; the ref normally
       // tracks via onScroll, but programmatic scrolls or layout shifts
@@ -3092,6 +3371,19 @@ export function ChatPane({
       el.removeEventListener('wheel', onWheel);
       el.removeEventListener('touchstart', onTouchStart);
       el.removeEventListener('touchmove', onTouchMove);
+      el.removeEventListener('pointerdown', onOtherInput);
+      el.removeEventListener('keydown', onOtherInput);
+      /*
+       * 这个节点不再是我们监听的那个了(面板卸载、日志被换掉)。挂在它身上的
+       * 证词跟着走,连同那一帧过期。
+       *
+       * ⚠️ 【实测交待】这一行单独撤掉现有测试也不会红:`setTab` 今天没有任何调用点,
+       * 所以这条 effect 的清理只在卸载时跑,跑完 ref 也跟着组件一起没了。
+       * 它防的是重挂之后的一个真实死法 —— `armWheelWitnessExpiry` 见到
+       * `wheelWitnessFrameRef` 非空就不再排帧,于是一个既没跑也没被取消的旧帧号
+       * 会让过期这条边界**永久失效**。这一天在 `tab` 真的会变的时候就会到。
+       */
+      resetWheelWitness();
     };
   }, [tab]);
 
@@ -3352,6 +3644,81 @@ export function ChatPane({
    */
   function rememberScrollSample(el: HTMLDivElement) {
     lastScrollSampleRef.current = readViewportSample(el);
+  }
+
+  /**
+   * 把滚轮见证撕掉,连同它那一帧过期定时。
+   *
+   * 每一个调用点都是一条**边界**,不是保险起见:用掉了(`onScroll`)、滚轮之外的
+   * 输入来了(`onOtherInput`)、上下文换了(切会话、面板卸载)。
+   *
+   * 特意**不**挂在 `rememberScrollSample` 上:我们自己写 `scrollTop` 在流式期间
+   * 随时可能插进「用户滚轮」和「随之而来的 scroll 事件」中间,把见证擦掉,
+   * 那一格夹取就又变回一次「用户上滑」。基线挪走这件事由判据里的 `atScrollTop`
+   * 处理 —— 它作废的是「对不上号的条子」,不是「所有条子」。
+   */
+  function resetWheelWitness() {
+    wheelWitnessRef.current = null;
+    const frame = wheelWitnessFrameRef.current;
+    wheelWitnessFrameRef.current = null;
+    if (frame === null) return;
+    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame);
+  }
+
+  /**
+   * 让这张条子最多活到下一帧。
+   *
+   * ## 为什么必须有这一条
+   *
+   * 用户已经在底部,再往下拨一格 —— 位置一个像素都不动,**连 scroll 事件都不发**。
+   * 那张条子于是没人来用掉。它要是能一直留着,后面任何一次**非滚轮**的位置变化
+   * (页内查找、焦点驱动的滚动)都会撞上它,被判成夹取 —— 跟随焊死。
+   *
+   * ## 为什么界限是「一帧」而不是一个毫秒数
+   *
+   * 夹取是**紧跟着**那一格滚轮的:合成器接管输入、把越界位置夹回、在同一次渲染
+   * 更新里把 scroll 事件发出来。按 HTML 规范的 update-the-rendering,scroll 事件
+   * 排在这一帧的 animation frame 回调**之前**,所以「这一格滚轮引起的 scroll」
+   * 一定在下一个 rAF 回调跑到之前就已经到了。一帧因此不是调出来的数,是那条因果
+   * 链本身的长度。
+   *
+   * ⚠️ 别把这个数和诊断包里的 3.8 秒搞混:那 3.8 秒是**点击写入**和夹取之间的
+   * 间隔(期间零条 JS 写入),不是滚轮和夹取之间的间隔。
+   *
+   * 后台标签页不发 rAF,所以这一条**不能**独自承担全部生命周期 —— 切会话那条
+   * 结构性的清理必须自己存在,不能指望这一帧替它兜底。
+   */
+  /**
+   * 把这一格滚轮记进见证。
+   *
+   * 条子是**按位置**攒的:位置一变就是新的一张。滚轮把日志真滚动了,那次位移
+   * 自己会带一个 scroll 事件来把旧条子用掉;而合成器卡住的那一档里位置纹丝不动,
+   * 同一张条子于是能把一次轻扫里的十几格(包括中途掉头的那几格)攒全。
+   *
+   * 没有 rAF 就**不记**:那样过期这条边界不存在,而一张不会过期的条子迟早会替
+   * 一次真正的用户上滑背书。没有见证只是回到这套东西出现之前的行为,是安全的那边。
+   */
+  function recordWheelWitness(el: HTMLDivElement, deltaY: number) {
+    if (deltaY === 0) return;
+    if (typeof requestAnimationFrame !== 'function') return;
+    const atScrollTop = el.scrollTop;
+    const current = wheelWitnessRef.current;
+    const witness =
+      current !== null && current.atScrollTop === atScrollTop
+        ? current
+        : { downwardEvents: 0, upwardEvents: 0, atScrollTop };
+    if (deltaY > 0) witness.downwardEvents += 1;
+    else witness.upwardEvents += 1;
+    wheelWitnessRef.current = witness;
+    armWheelWitnessExpiry();
+  }
+
+  function armWheelWitnessExpiry() {
+    if (wheelWitnessFrameRef.current !== null) return;
+    wheelWitnessFrameRef.current = requestAnimationFrame(() => {
+      wheelWitnessFrameRef.current = null;
+      wheelWitnessRef.current = null;
+    });
   }
 
   /** 唯一的 `scrollTop` 写入口:写完就记基线。 */
@@ -4415,6 +4782,10 @@ export function ChatPane({
                                 type="button"
                                 variant={errorActionVariant}
                                 data-testid="chat-error-switch-model"
+                                // 选完模型自动重跑那一半也走同一组门控
+                                // (`ProjectView` 的 rerun effect),挡住时这颗
+                                // 只会把选择器打开然后什么都不发生。
+                                disabled={recoveryActionsDisabled}
                                 onClick={() => {
                                   trackRecoveryClick(retryAssistant, 'switch_model_retry');
                                   if (onSwitchModel && retryAssistant) onSwitchModel(retryAssistant);
@@ -4530,6 +4901,7 @@ export function ChatPane({
                               <RunErrorCardAction
                                 type="button"
                                 variant={errorActionVariant}
+                                disabled={recoveryActionsDisabled}
                                 onClick={() =>
                                   {
                                     trackRecoveryClick(retryAssistant, 'resume_run');
@@ -4550,17 +4922,32 @@ export function ChatPane({
                                * 4px 11px)—— 排在一起圆角明显对不上(用户 2026-08-27)。
                                * 图标也照稿子补上:那一排三颗都带图标。
                                */
+                              /*
+                               * 可用态和标签都跟着**真实状态**走(OPEND-2821 / 2758)。
+                               *
+                               * ⚠️ 埋点语义在这里定了下来:**被挡住的点击不再算一次
+                               * recovery click**。禁用的按钮根本不触发 onClick,所以
+                               * `trackRecoveryClick` 只在真的会起一发的时候上报。
+                               * 这是有意的 —— `run_recovery_action` 的 click 事件靠
+                               * `recovery_action_instance_id` 和 `run_created` /
+                               * `run_finished` 对账,而在此之前这颗按钮在六种门控下
+                               * 静默 `return`,却照样上报了一次点击:那些是永远对不上
+                               * 账的孤儿,读起来像「用户试过重试然后凭空消失」。
+                               * 「这一档出现在屏幕上」仍由既有的 surface_view 记录,
+                               * 那一条不受这次改动影响。
+                               */
                               <RunErrorCardAction
                                 type="button"
                                 variant={errorActionVariant}
                                 data-testid="chat-error-retry"
+                                disabled={recoveryActionsDisabled}
                                 onClick={() => {
                                   trackRecoveryClick(retryAssistant, 'manual_retry');
                                   onRetry(retryAssistant, 'manual_retry');
                                 }}
                               >
                                 <Icon name="refresh" size={11} />
-                                {t('promptTemplates.retry')}
+                                {t(retryLabelKey)}
                               </RunErrorCardAction>
                             ) : null}
                           </RunErrorCardActionGroup>
@@ -4587,6 +4974,9 @@ export function ChatPane({
                             type="button"
                             variant="primary"
                             data-testid="chat-error-switch-to-cloud"
+                            // `handleSwitchToAmrAndRetry` 头一行就是同一道门控;
+                            // 挡住时这颗按钮点下去连设置面板都不会开。
+                            disabled={recoveryActionsDisabled}
                             onClick={() => {
                               trackRunFailedToastGoAmrClick(analytics.track, {
                                 page_name: 'chat_panel',
@@ -4615,7 +5005,18 @@ export function ChatPane({
                         ) : null}
                       </>
                     )}
-                  />
+                  >
+                    {/*
+                      * 「不能重试时说明阻断原因,不应静默无响应」(OPEND-2821)。
+                      * 只在**真有动作被挡住**时出现:一张本来就没有恢复动作的卡
+                      * (CPU 不支持、运行时定义非法)不该多一句和它无关的解释。
+                      */}
+                    {recoveryActionsBlockedReason && showErrorActions ? (
+                      <RunErrorCardBlockedNote>
+                        {t(recoveryActionBlockMessageKey(recoveryActionsBlockedReason))}
+                      </RunErrorCardBlockedNote>
+                    ) : null}
+                  </RunErrorCard>
                 ) : null}
                 {/*
                   * 升级卡(交付稿第 75 / 76 格)。**流水里的一张卡,不是弹窗** ——
@@ -5447,7 +5848,7 @@ function ChatRows({
     }
     return byMessageId;
   }, [messages]);
-  const virtualized = items.length > CHAT_MESSAGE_VIRTUALIZE_THRESHOLD;
+  const virtualized = isChatVirtualized(items);
   const virtualWindow = useMeasuredVirtualWindow(items, {
     enabled: virtualized,
     containerRef: scrollContainerRef,
@@ -5731,6 +6132,18 @@ function buildChatRenderItems(messages: ChatMessage[]): ChatRenderItem[] {
     });
   }
   return items;
+}
+
+/**
+ * 转录此刻**走不走虚拟窗口**。
+ *
+ * 一个判据,两个消费者:`ChatRows` 按它决定怎么画,chat-health 按它上报
+ * `virtualized`。写成两处 `items.length > 阈值` 今天读起来一模一样,
+ * 等这条规则长出第二个条件的那天就会分家 —— 那时埋点描述的是渲染层
+ * **已经不用了**的那种模式,而看板上没有任何东西会喊。
+ */
+function isChatVirtualized(items: ChatRenderItem[]): boolean {
+  return items.length > CHAT_MESSAGE_VIRTUALIZE_THRESHOLD;
 }
 
 /**
