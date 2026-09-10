@@ -302,6 +302,7 @@ import { amrModelLoadingCache } from './runtimes/amr-model-cache.js';
 import {
   fetchVelaPresetModels,
   fetchVelaRemoteModelsWithRetry,
+  isVelaChatCapableModelId,
 } from './runtimes/defs/amr.js';
 import { migrateLegacyDataDirSync } from './migration/index.js';
 import {
@@ -713,6 +714,7 @@ import {
   validateTarget as validateRoutineTarget,
 } from './routines.js';
 import { buildMcpInstallPayload } from './mcp-install-info.js';
+import { configureDiagnosticsEvidence } from './services/diagnostics-evidence.js';
 import { createDiagnosticsExportHandler } from './diagnostics-export.js';
 import {
   CHAT_SCROLL_FORENSICS_PATH,
@@ -1342,6 +1344,7 @@ const SANDBOX_MODE_ENABLED = isSandboxModeEnabled(process.env);
 const RUNTIME_DATA_DIR = resolveDataDir(process.env.OD_DATA_DIR, PROJECT_ROOT, {
   requireExplicit: SANDBOX_MODE_ENABLED,
 });
+configureDiagnosticsEvidence(RUNTIME_DATA_DIR);
 const SANDBOX_RUNTIME = resolveSandboxRuntimeConfig(SANDBOX_MODE_ENABLED, RUNTIME_DATA_DIR);
 ensureSandboxRuntimeDirs(SANDBOX_RUNTIME);
 const PLUGIN_LOCKFILE_PATH = path.join(RUNTIME_DATA_DIR, 'od-plugin-lock.json');
@@ -12010,9 +12013,20 @@ export async function startServer({
      * (emit one inline marker the host parses and strips), same "don't narrate
      * this to the user" clause.
      */
+    /*
+     * The run's UI locale rides along (OPEND-2765).
+     *
+     * `# UI locale override` states the same rule, but it lives in
+     * `daemonSystemPrompt` — the cache-stable head, which the payload below
+     * drops whenever `includeStableForPayload` is false. These three markers
+     * are re-sent every turn because of the nonce, so on a resume turn the
+     * marker contract was arriving with no locale attached and the follow-up
+     * suggestions came back in English on a zh-CN run.
+     */
     const hostProtocol = renderChatTurnHostProtocolInstructions(
       typeof run.doneKey === 'string' ? run.doneKey : '',
       'ordinary',
+      typeof locale === 'string' ? locale : undefined,
     );
     /*
      * This turn's follow-up suggestions.
@@ -13279,6 +13293,17 @@ export async function startServer({
       // catalog can lag the live one, and a logged-in user picked a concrete
       // id; vela rejects a truly unsupported model at `session/set_model` with
       // a precise error, which beats a pre-emptive block on a flaky metadata read.
+    }
+
+    if (
+      def.id === 'amr' &&
+      safeModel &&
+      !isVelaChatCapableModelId(safeModel)
+    ) {
+      send('error', createAmrModelUnavailablePayload(safeModel, {
+        reason: 'model_not_chat_capable',
+      }));
+      return finishStrategyAwarePhysicalRun('failed', 1, null);
     }
 
     // Plain-streaming adapters that own a "continue most recent
@@ -16724,6 +16749,11 @@ export async function startServer({
               task: strategyTaskAtStart,
               parsed: strategyProtocolResult,
               toolUseCount: strategyToolUseCount,
+              // OPEND-2765: the production stage closes with the keyed host
+              // protocols, whose follow-up suggestions are user-visible prose.
+              ...(typeof chatBody.locale === 'string' && chatBody.locale
+                ? { locale: chatBody.locale }
+                : {}),
               ...(executionPreflight ? { executionPreflight } : {}),
               ...(complexRuntimeEvidence ? { complexRuntimeEvidence } : {}),
               ...(
